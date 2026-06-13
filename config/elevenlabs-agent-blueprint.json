@@ -1,0 +1,110 @@
+{
+  "agent_name": "Unforgettable Archivista",
+  "language": "hu",
+  "official_mcp": {
+    "repository": "https://github.com/elevenlabs/elevenlabs-mcp",
+    "config_example": "config/elevenlabs-mcp-config.example.json",
+    "builder_tools": [
+      "create_agent",
+      "add_knowledge_base_to_agent",
+      "get_agent",
+      "list_agents",
+      "get_conversation",
+      "list_conversations",
+      "text_to_speech",
+      "speech_to_text",
+      "search_voices",
+      "search_voice_library",
+      "text_to_voice",
+      "create_voice_from_preview"
+    ]
+  },
+  "personality": {
+    "role": "hangalapú kreatív archivista és diszkrét gondolkodótárs",
+    "tone": "nyugodt, figyelmes, nem tolakodó, kreatív, pontos",
+    "first_message": "Itt vagyok. Mondd, amit menteni, keresni vagy továbbvinni szeretnél.",
+    "system_prompt": "Te vagy az Unforgettable Archivista, egy magyar nyelvű, hangalapú kreatív memória-asszisztens. A célod a felhasználó gondolatainak megőrzése, visszakeresése és explicit kérésre történő továbbküldése. Ne szakítsd félbe a gondolkodást. A csend gondolkodás. Ne értékeld automatikusan a kreatív anyagot. Mindig különítsd el az eredeti anyagot a saját javaslataidtól. Ha a felhasználó azt kéri, hogy keress régi gondolatot, használd az Unforgettable archívumkereső toolt. Ha mentést kér, mentsd sessionként. Email, Google Docs vagy OpenAI továbbküldést csak explicit kérésre indíts. Ha nem vagy biztos a szándékban, kérdezz vissza röviden."
+  },
+  "server_tool_gateway": {
+    "url": "https://YOUR_DOMAIN/api/elevenlabs-agent-tool.php",
+    "method": "POST",
+    "headers": {
+      "Authorization": "Bearer {{ELEVENLABS_AGENT_TOOL_SECRET}}",
+      "Content-Type": "application/json"
+    }
+  },
+  "tools": [
+    {
+      "name": "search_archive",
+      "description": "Keresés az Unforgettable session archívumban régi gondolatok, versek, ötletek, kutatási kérdések és outputok között.",
+      "body": {
+        "action": "search_archive",
+        "query": "{{query}}",
+        "limit": 5
+      }
+    },
+    {
+      "name": "get_session",
+      "description": "Egy konkrét Unforgettable session részleteinek betöltése session_id alapján.",
+      "body": {
+        "action": "get_session",
+        "session_id": "{{session_id}}"
+      }
+    },
+    {
+      "name": "save_memory",
+      "description": "Új gondolat vagy beszélgetés mentése Unforgettable sessionként.",
+      "body": {
+        "action": "save_memory",
+        "title": "{{title}}",
+        "text": "{{text}}",
+        "important": false
+      }
+    },
+    {
+      "name": "append_memory",
+      "description": "Meglévő session folytatása új szövegrésszel.",
+      "body": {
+        "action": "append_memory",
+        "session_id": "{{session_id}}",
+        "text": "{{text}}",
+        "important": false
+      }
+    },
+    {
+      "name": "prepare_email",
+      "description": "Session email export előkészítése vagy küldése, ha a szerveren engedélyezve van.",
+      "body": {
+        "action": "prepare_email",
+        "session_id": "{{session_id}}",
+        "to": "{{email}}"
+      }
+    },
+    {
+      "name": "prepare_google_doc",
+      "description": "Session Google Docs dokumentumtartalom előkészítése.",
+      "body": {
+        "action": "prepare_google_doc",
+        "session_id": "{{session_id}}"
+      }
+    },
+    {
+      "name": "send_openai_summary",
+      "description": "Session összefoglaló küldése OpenAI Responses API-ba, ha OpenAI kulcs be van állítva.",
+      "body": {
+        "action": "send_openai_summary",
+        "session_id": "{{session_id}}"
+      }
+    }
+  ],
+  "post_call_webhook": {
+    "url": "https://YOUR_DOMAIN/api/elevenlabs-webhook.php",
+    "method": "POST",
+    "secret_env": "ELEVENLABS_WEBHOOK_SECRET",
+    "behavior": "A webhook nyers payloadot ment, transcriptet próbál kinyerni, majd ha van szöveg, automatikusan Unforgettable sessiont hoz létre."
+  },
+  "knowledge_base_strategy": {
+    "primary": "ElevenLabs built-in knowledge base search akkor hasznos, ha a teljes archívumot ElevenLabs KB-be szinkronizáljuk.",
+    "runtime_default": "Az Unforgettable élő archívumkereséséhez a search_archive server tool marad az elsődleges, mert mindig a JSON session fájlok aktuális állapotát látja."
+  }
+}
