@@ -19,20 +19,20 @@
   <main id="main-content" tabindex="-1">
     <section id="loading-view" class="centered-view" data-view="loading" aria-labelledby="loading-title">
       <p class="eyebrow">ELŐKÉSZÍTÉS</p>
-      <h1 id="loading-title">A vakteszt betöltése…</h1>
+      <h1 id="loading-title" tabindex="-1">A vakteszt betöltése…</h1>
       <p>Kérlek, várj egy pillanatot.</p>
     </section>
 
     <section id="error-view" class="centered-view" data-view="error" hidden aria-labelledby="error-title">
       <p class="eyebrow">HIBA</p>
-      <h1 id="error-title">A teszt most nem érhető el</h1>
+      <h1 id="error-title" tabindex="-1">A teszt most nem érhető el</h1>
       <p id="error-message" role="alert"></p>
       <button id="retry-button" class="button button-primary" type="button">Újrapróbálás</button>
     </section>
 
     <section id="start-view" class="centered-view intro" data-view="start" hidden aria-labelledby="start-title">
       <p class="eyebrow">EGY ÉRTÉKELŐ · 30 ÖSSZEHASONLÍTÁS</p>
-      <h1 id="start-title">Olvasd el. Vesd össze. Indokold meg.</h1>
+      <h1 id="start-title" tabindex="-1">Olvasd el. Vesd össze. Indokold meg.</h1>
       <p>Két névtelen szöveget kapsz minden briefhez. A rendszerek neve és az összesítés csak a teljes teszt véglegesítése után válik láthatóvá.</p>
       <ul>
         <li>A Bal és Jobb jelölt minden képernyőn azonos súlyt kap.</li>
@@ -43,7 +43,7 @@
     </section>
 
     <section id="compare-view" data-view="compare" hidden aria-labelledby="compare-title">
-      <h1 id="compare-title" class="visually-hidden">Szövegek összehasonlítása</h1>
+      <h1 id="compare-title" tabindex="-1" class="visually-hidden">Szövegek összehasonlítása</h1>
       <details class="brief" open>
         <summary><span>FELADATBRIEF</span><span class="summary-action">Részletek</span></summary>
         <p id="brief-text"></p>
@@ -106,7 +106,7 @@
 
     <section id="review-view" class="review-view" data-view="review" hidden aria-labelledby="review-title">
       <p class="eyebrow">ELLENŐRZÉS</p>
-      <h1 id="review-title">Minden döntés mentve</h1>
+      <h1 id="review-title" tabindex="-1">Minden döntés mentve</h1>
       <p>A véglegesítés után megjelennek a rendszernevek és az összesített eredmények. A válaszok ezután már nem módosíthatók.</p>
       <div id="review-items" class="review-items" aria-label="Mentett válaszok"></div>
       <div class="review-actions">
@@ -117,7 +117,7 @@
 
     <section id="finalized-view" class="results-view" data-view="finalized" hidden aria-labelledby="results-title">
       <p class="eyebrow">VÉGLEGESÍTVE</p>
-      <h1 id="results-title">A vakteszt eredménye</h1>
+      <h1 id="results-title" tabindex="-1">A vakteszt eredménye</h1>
       <p>Az alábbi nézet már feloldja a rendszerneveket. Az értékelés lezárt és nem módosítható.</p>
       <div id="overall-results" class="overall-results"></div>
       <h2>Tételes eredmények és visszajelzések</h2>

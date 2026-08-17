@@ -50,8 +50,20 @@
     return reducedMotion ? "auto" : "smooth";
   }
 
+  function focusTargetForState(view) {
+    return {
+      loading: "loading-title",
+      error: "error-title",
+      start: "start-title",
+      compare: "compare-title",
+      review: "review-title",
+      finalized: "results-title"
+    }[view] || "main-content";
+  }
+
   const publicApi = {
-    deriveState, validateAnswer, buildAnswerPayload, navigationAvailability, scrollBehavior
+    deriveState, validateAnswer, buildAnswerPayload, navigationAvailability,
+    scrollBehavior, focusTargetForState
   };
   if (typeof module !== "undefined" && module.exports) module.exports = publicApi;
   if (typeof document === "undefined") return;
@@ -123,9 +135,17 @@
     state.view = name;
     for (const view of elements.views) view.hidden = view.dataset.view !== name;
     updateHeader();
-    const active = elements.views.find((view) => view.dataset.view === name);
-    const heading = active && active.querySelector("h1");
-    if (heading) heading.focus({ preventScroll: true });
+    focusActiveView(name);
+  }
+
+  function focusActiveView(name) {
+    const target = byId(focusTargetForState(name)) || byId("main-content");
+    if (!target) return;
+    try {
+      target.focus({ preventScroll: true });
+    } catch (_error) {
+      target.focus();
+    }
   }
 
   function scrollToTop() {

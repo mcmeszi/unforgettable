@@ -290,6 +290,12 @@ class HumanBlindTestTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, html)
+        for focus_target in (
+            "loading-title", "error-title", "start-title",
+            "compare-title", "review-title", "results-title",
+        ):
+            with self.subTest(focus_target=focus_target):
+                self.assertIn(f'id="{focus_target}" tabindex="-1"', html)
         for endpoint in ("/api/test", "/api/progress", "/api/answer", "/api/finalize", "/api/results"):
             with self.subTest(endpoint=endpoint):
                 self.assertIn(endpoint, script)
@@ -321,6 +327,8 @@ const result = {
     app.navigationAvailability({currentIndex: 1, busy: true})
   ],
   scrollBehavior: [app.scrollBehavior(false), app.scrollBehavior(true)],
+  focusTargets: ["loading", "error", "start", "compare", "review", "finalized", "unknown"]
+    .map((view) => app.focusTargetForState(view)),
   payload: app.buildAnswerPayload("item-07", {
     choice: "right", reason: "  legalább tíz karakter  ",
     leftHighlight: " bal idézet ", leftNote: " bal jegyzet ",
@@ -344,6 +352,10 @@ process.stdout.write(JSON.stringify(result));
             {"backEnabled": False}, {"backEnabled": True}, {"backEnabled": False},
         ])
         self.assertEqual(result["scrollBehavior"], ["smooth", "auto"])
+        self.assertEqual(result["focusTargets"], [
+            "loading-title", "error-title", "start-title", "compare-title",
+            "review-title", "results-title", "main-content",
+        ])
         self.assertEqual(result["payload"], {
             "item_id": "item-07", "choice": "right", "reason": "legalább tíz karakter",
             "flags": [], "left_highlight": "bal idézet", "left_note": "bal jegyzet",
