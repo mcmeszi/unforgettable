@@ -16,6 +16,7 @@
 - Never expose `legacy`, `engine_v3`, `A`, `B`, source IDs, or provenance mappings in the public pack.
 - Bind only to `127.0.0.1`; make no external network requests and add no runtime dependency.
 - Require `left`, `right`, or `tie` plus a reason of at least 10 trimmed characters.
+- Allow per-candidate optional highlighted excerpts up to 500 characters, per-candidate notes up to 1500 characters, and one general note up to 1500 characters.
 - Reject finalization until all 30 answers are valid; finalized runs are immutable.
 - Never write retrieval utility, voice feedback, or learned reranker preference.
 - Keep packs, private keys, progress, and results under gitignored `skills/peter-irta/state/`.
@@ -123,6 +124,20 @@ def test_answer_requires_known_item_choice_and_reason(self):
     with self.assertRaisesRegex(ValueError, "choice"):
         run.save_answer("item-01", "engine_v3", "legalább tíz karakter")
 
+def test_candidate_notes_are_bounded_and_unblinded_to_the_correct_system(self):
+    run = self.make_run()
+    with self.assertRaisesRegex(ValueError, "500"):
+        run.save_answer("item-01", "left", "legalább tíz karakter",
+                        left_highlight="x" * 501)
+    run.save_answer("item-01", "left", "legalább tíz karakter",
+                    left_highlight="ez a sor tetszett",
+                    left_note="feszes és természetes",
+                    right_note="jó kép, de modoros")
+    self.answer_remaining(run)
+    item = run.finalize()["items"][0]
+    self.assertEqual(item["candidate_feedback"]["engine_v3"]["highlight"],
+                     "ez a sor tetszett")
+
 def test_finalize_is_blocked_until_complete_then_becomes_immutable(self):
     run = self.make_run()
     with self.assertRaisesRegex(RuntimeError, "30"):
@@ -152,11 +167,14 @@ class BlindTestRun:
                  progress_path: Path, result_path: Path): ...
     def snapshot(self) -> dict: ...
     def save_answer(self, item_id: str, choice: str, reason: str,
-                    flags: list[str] | None = None) -> dict: ...
+                    flags: list[str] | None = None,
+                    left_highlight: str = "", right_highlight: str = "",
+                    left_note: str = "", right_note: str = "",
+                    general_note: str = "") -> dict: ...
     def finalize(self) -> dict: ...
 ```
 
-Validate manifest hashes on construction. Store only item ID, choice, trimmed reason, allowed flags, and timestamps in progress. Write through a sibling temporary file and `Path.replace`. On finalize, translate the chosen position through the private key, aggregate overall and by genre, include draft hashes but no text, and set both learning flags to `false`.
+Validate manifest hashes on construction. Store only item ID, choice, trimmed reason, allowed flags, bounded optional candidate highlights/notes, general note, and timestamps in progress. Write through a sibling temporary file and `Path.replace`. On finalize, translate the chosen position and both candidate-feedback blocks through the private key, aggregate overall and by genre, include draft hashes but no full text, set both learning flags to `false`, and set `feedback_review_required` to `true`.
 
 - [ ] **Step 4: Implement the HTTP adapter**
 
@@ -201,6 +219,10 @@ def test_frontend_assets_and_required_copy_exist(self):
     script = (asset_root / "app.js").read_text(encoding="utf-8")
     self.assertIn('id="left-candidate"', html)
     self.assertIn('id="right-candidate"', html)
+    self.assertIn('id="left-highlight"', html)
+    self.assertIn('id="left-note"', html)
+    self.assertIn('id="right-highlight"', html)
+    self.assertIn('id="right-note"', html)
     self.assertIn("Véglegesítés", html)
     self.assertIn("/api/answer", script)
     self.assertIn("/api/finalize", script)
@@ -216,7 +238,7 @@ Extract exact colors, typography, spacing, borders, radii, and responsive rules 
 
 - [ ] **Step 5: Implement the interaction state machine**
 
-`app.js` owns `start`, `compare`, `review`, and `finalized` states. Disable Next until choice and 10-character reason are present. Save through `/api/answer`, reload through `/api/progress`, show no score during the run, confirm before `/api/finalize`, and render the returned unblinded overall and per-item result.
+`app.js` owns `start`, `compare`, `review`, and `finalized` states. Each candidate column includes optional highlighted-excerpt and positive-note fields; the pair includes an optional general note. Disable Next until choice and 10-character reason are present. Save all fields through `/api/answer`, reload through `/api/progress`, show no score during the run, confirm before `/api/finalize`, and render the returned unblinded overall, per-item result, and system-bound candidate feedback.
 
 - [ ] **Step 6: Run static-contract and full tests**
 
@@ -278,7 +300,7 @@ Launch with the real benchmark paths and an unused loopback port. Confirm the re
 
 - [ ] **Step 2: Verify the core workflow in Browser/IAB**
 
-Open the local URL. Check start → first answer → refresh/reload persistence → back navigation → remaining answers → review. In a disposable copied progress file, complete all 30 and verify finalization and reveal. Confirm a second write is rejected.
+Open the local URL. Check start → first answer with candidate highlights/notes → refresh/reload persistence → back navigation → remaining answers → review. In a disposable copied progress file, complete all 30 and verify finalization, reveal, and correct system binding of both candidates' feedback. Confirm a second write is rejected.
 
 - [ ] **Step 3: Perform visual QA against the approved concept**
 

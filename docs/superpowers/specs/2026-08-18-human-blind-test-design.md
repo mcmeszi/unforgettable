@@ -72,6 +72,11 @@ Egy fókuszált, editorial jellegű összehasonlító felület készüljön:
 - keskeny kijelzőn egymás alatti szövegek, egyértelmű Bal/Jobb címkével;
 - döntés: Bal / Jobb / Döntetlen;
 - legalább 10 karakteres kötelező indok;
+- mindkét jelölthöz opcionális „Kiemelt sor vagy megfogalmazás” mező, legfeljebb
+  500 karakterrel;
+- mindkét jelölthöz opcionális „Miért tetszett / mit vinnél tovább?” megjegyzés,
+  legfeljebb 1500 karakterrel;
+- opcionális, legfeljebb 1500 karakteres általános megjegyzés a párról;
 - opcionális hibajelölések: brief-tévesztés, műfajidegenség, hamis Péter-hang,
   modorosság/karikatúra, hard-guard probléma;
 - előre és vissza navigálás, mentett állapot visszatöltése;
@@ -85,8 +90,9 @@ A frontend ne használjon külső fontot, analitikát, CDN-t vagy hálózati ké
 
 1. A preparáló létrehozza és hash-eli a public packot és a private keyt.
 2. A szerver betölti mindkettőt, de a frontendnek csak a public packot adja át.
-3. Minden válasz mentése után a szerver ideiglenes fájlba ír, majd atomikusan
-   lecseréli az aktív progress JSON-t.
+3. Minden válasz — döntés, indok, hibajelölések és opcionális jelöltenkénti
+   kiemelések/megjegyzések — mentése után a szerver ideiglenes fájlba ír, majd
+   atomikusan lecseréli az aktív progress JSON-t.
 4. A frontend frissítés vagy újraindítás után a szervertől tölti vissza az állapotot.
 5. A finalizálás csak 30 érvényes döntés és indok mellett sikerül.
 6. Sikeres finalizáláskor a szerver feloldja a pozíciókat, kiszámítja a
@@ -99,13 +105,16 @@ A lezárt JSON tartalmazza:
 
 - schema version, run-ID, seed és timestamp;
 - public pack és private key SHA-256;
-- briefenként a vak döntést, indokot, hibajelöléseket és feloldott rendszert;
+- briefenként a vak döntést, indokot, hibajelöléseket, feloldott rendszert,
+  valamint rendszerhez visszakötött kiemeléseket és megjegyzéseket;
 - Engine v3 / V1 / döntetlen darabszámot;
 - műfajonkénti bontást;
-- explicit mezőt: `utility_written=false` és
-  `learned_preference_claimed=false`.
+- explicit mezőt: `utility_written=false`, `learned_preference_claimed=false`
+  és `feedback_review_required=true`.
 
-Nyers draftszöveg ne kerüljön az eredményfájlba; csak draft-hash és test-ID.
+Teljes nyers draftszöveg ne kerüljön az eredményfájlba; csak draft-hash és
+test-ID. Kivétel a Péter által kézzel bemásolt, legfeljebb 500 karakteres kiemelt
+részlet: ez szándékos emberi feedback-evidence, nem automatikus tréningadat.
 
 ## Hibakezelés és biztonsági kapuk
 
@@ -128,6 +137,8 @@ Automatizált tesztek fedjék le:
 - a public pack rendszer- és source-ID-mentességét;
 - a hash-ellenőrzést;
 - az érvényes és érvénytelen answer contractot;
+- a jelöltenkénti kiemelés/megjegyzés hosszkorlátját és feloldás utáni helyes
+  rendszerhez kötését;
 - a korai finalizálás tiltását;
 - a végső feloldás és összesítés helyességét;
 - azt, hogy utility és learned preference nem íródik.
