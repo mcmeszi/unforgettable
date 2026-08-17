@@ -7,7 +7,15 @@ import hashlib
 import json
 import random
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
+
+
+ALLOWED_FLAGS = frozenset({"tie", "both_weak", "both_strong", "brief_problem", "unclear"})
+MAX_REASON_LENGTH = 2_000
+MAX_FEEDBACK_LENGTH = 500
+MAX_GENERAL_NOTE_LENGTH = 1_000
 
 
 def canonical_sha256(payload: dict) -> str:
@@ -129,3 +137,219 @@ def validate_public_pack(pack: dict) -> list[str]:
             errors.append("public items must include left and right draft hashes")
             break
     return errors
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+class BlindTestRun:
+    """Persist and unblind one local human blind-test run without learning side effects."""
+
+    def __init__(self, public: dict, private: dict, manifest: dict,
+                 progress_path: Path, result_path: Path):
+        self.public = public
+        self.private = private
+        self.manifest = manifest
+        self.progress_path = Path(progress_path)
+        self.result_path = Path(result_path)
+        self._lock = RLock()
+        self._validate_inputs()
+        self._items = {item["item_id"]: item for item in self.public["items"]}
+
+    def _validate_inputs(self) -> None:
+        errors = validate_public_pack(self.public)
+        if errors:
+            raise ValueError("invalid public pack: " + "; ".join(errors))
+        if not isinstance(self.manifest, dict):
+            raise ValueError("manifest must be an object")
+        if self.manifest.get("item_count") != len(self.public["items"]):
+            raise ValueError("manifest item count does not match public pack")
+        if self.manifest.get("public_sha256") != canonical_sha256(self.public):
+            raise ValueError("public manifest hash mismatch")
+        if self.manifest.get("private_sha256") != canonical_sha256(self.private):
+            raise ValueError("private manifest hash mismatch")
+        private_items = self.private.get("items") if isinstance(self.private, dict) else None
+        if not isinstance(private_items, dict) or set(private_items) != {item["item_id"] for item in self.public["items"]}:
+            raise ValueError("private key items do not match public pack")
+        for item_id, mapping in private_items.items():
+            if not isinstance(mapping, dict) or {mapping.get("left"), mapping.get("right")} != {"legacy", "engine_v3"}:
+                raise ValueError(f"private key has invalid system mapping for {item_id}")
+
+    def _load_progress(self) -> dict:
+        if not self.progress_path.exists():
+            return {
+                "schema_version": 1,
+                "public_sha256": self.manifest["public_sha256"],
+                "created_at": _utc_timestamp(),
+                "answers": {},
+            }
+        try:
+            progress = json.loads(self.progress_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"invalid progress file: {error}") from error
+        if not isinstance(progress, dict) or progress.get("public_sha256") != self.manifest["public_sha256"]:
+            raise ValueError("progress does not belong to this public pack")
+        answers = progress.get("answers")
+        if not isinstance(answers, dict):
+            raise ValueError("progress answers must be an object")
+        return progress
+
+    def _load_result(self) -> dict | None:
+        if not self.result_path.exists():
+            return None
+        try:
+            result = json.loads(self.result_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"invalid finalized result: {error}") from error
+        if not isinstance(result, dict) or result.get("public_sha256") != self.manifest["public_sha256"]:
+            raise ValueError("finalized result does not belong to this public pack")
+        return result
+
+    @staticmethod
+    def _bounded_text(value: str, field: str, maximum: int) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be text")
+        normalized = value.strip()
+        if len(normalized) > maximum:
+            raise ValueError(f"{field} must be at most {maximum} characters")
+        return normalized
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            progress = self._load_progress()
+            finalized = self._load_result() is not None
+            answers = progress["answers"]
+            items = []
+            for item in self.public["items"]:
+                visible = dict(item)
+                answer = answers.get(item["item_id"])
+                if answer:
+                    visible["answer"] = dict(answer)
+                items.append(visible)
+            return {
+                "schema_version": 1,
+                "item_count": len(items),
+                "answered_count": len(answers),
+                "finalized": finalized,
+                "items": items,
+            }
+
+    def save_answer(self, item_id: str, choice: str, reason: str,
+                    flags: list[str] | None = None,
+                    left_highlight: str = "", right_highlight: str = "",
+                    left_note: str = "", right_note: str = "",
+                    general_note: str = "") -> dict:
+        with self._lock:
+            if self._load_result() is not None:
+                raise RuntimeError("test has already been finalized")
+            if item_id not in self._items:
+                raise ValueError("unknown item")
+            if choice not in {"left", "right"}:
+                raise ValueError("choice must be left or right")
+            reason = self._bounded_text(reason, "reason", MAX_REASON_LENGTH)
+            if len(reason) < 10:
+                raise ValueError("reason must be at least 10 characters")
+            if flags is None:
+                flags = []
+            if not isinstance(flags, list) or any(not isinstance(flag, str) for flag in flags):
+                raise ValueError("flags must be a list")
+            normalized_flags = [flag.strip() for flag in flags]
+            if len(set(normalized_flags)) != len(normalized_flags) or any(flag not in ALLOWED_FLAGS for flag in normalized_flags):
+                raise ValueError("flags contain an unsupported value")
+            answer = {
+                "item_id": item_id,
+                "choice": choice,
+                "reason": reason,
+                "flags": normalized_flags,
+                "left_highlight": self._bounded_text(left_highlight, "left_highlight", MAX_FEEDBACK_LENGTH),
+                "right_highlight": self._bounded_text(right_highlight, "right_highlight", MAX_FEEDBACK_LENGTH),
+                "left_note": self._bounded_text(left_note, "left_note", MAX_FEEDBACK_LENGTH),
+                "right_note": self._bounded_text(right_note, "right_note", MAX_FEEDBACK_LENGTH),
+                "general_note": self._bounded_text(general_note, "general_note", MAX_GENERAL_NOTE_LENGTH),
+                "updated_at": _utc_timestamp(),
+            }
+            progress = self._load_progress()
+            progress["answers"][item_id] = answer
+            progress["updated_at"] = answer["updated_at"]
+            _atomic_write_json(self.progress_path, progress)
+            return self.snapshot()
+
+    def finalized_result(self) -> dict:
+        """Return the already-written immutable result without triggering unblinding."""
+        with self._lock:
+            result = self._load_result()
+            if result is None:
+                raise RuntimeError("test is not finalized")
+            return result
+
+    def finalize(self) -> dict:
+        with self._lock:
+            existing = self._load_result()
+            if existing is not None:
+                return existing
+            progress = self._load_progress()
+            answers = progress["answers"]
+            item_count = len(self._items)
+            if len(answers) != item_count or set(answers) != set(self._items):
+                raise RuntimeError(f"all {item_count} answers are required before finalization")
+            overall = {"legacy": 0, "engine_v3": 0}
+            by_genre: dict[str, dict[str, int]] = {}
+            result_items = []
+            for public_item in self.public["items"]:
+                item_id = public_item["item_id"]
+                answer = answers[item_id]
+                private_item = self.private["items"][item_id]
+                chosen_system = private_item[answer["choice"]]
+                overall[chosen_system] += 1
+                genre = public_item["genre"]
+                genre_totals = by_genre.setdefault(genre, {"legacy": 0, "engine_v3": 0})
+                genre_totals[chosen_system] += 1
+                candidate_feedback = {
+                    private_item["left"]: {
+                        "highlight": answer["left_highlight"],
+                        "note": answer["left_note"],
+                    },
+                    private_item["right"]: {
+                        "highlight": answer["right_highlight"],
+                        "note": answer["right_note"],
+                    },
+                }
+                result_items.append({
+                    "item_id": item_id,
+                    "brief_id": public_item["brief_id"],
+                    "genre": genre,
+                    "choice": answer["choice"],
+                    "chosen_system": chosen_system,
+                    "reason": answer["reason"],
+                    "flags": answer["flags"],
+                    "candidate_feedback": candidate_feedback,
+                    "general_note": answer["general_note"],
+                    "answered_at": answer["updated_at"],
+                    "draft_hashes": dict(public_item["draft_hashes"]),
+                })
+            result = {
+                "schema_version": 1,
+                "public_sha256": self.manifest["public_sha256"],
+                "private_sha256": self.manifest["private_sha256"],
+                "finalized_at": _utc_timestamp(),
+                "item_count": item_count,
+                "overall": overall,
+                "by_genre": by_genre,
+                "items": result_items,
+                "utility_written": False,
+                "learned_preference_claimed": False,
+                "feedback_review_required": True,
+            }
+            _atomic_write_json(self.result_path, result)
+            return result

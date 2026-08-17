@@ -1,8 +1,10 @@
 import importlib.util
+import http.client
 import json
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -12,6 +14,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 MODULE_PATH = SCRIPTS / "human_blind_test.py"
 PREPARER_PATH = SCRIPTS / "prepare_human_blind_test.py"
+SERVER_PATH = SCRIPTS / "human_blind_test_server.py"
 SPEC = importlib.util.spec_from_file_location("human_blind_test", MODULE_PATH)
 human_blind = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -115,6 +118,119 @@ class HumanBlindTestTests(unittest.TestCase):
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("refusing non-empty output directory", completed.stderr.decode(errors="replace"))
+
+    def make_run(self):
+        public, private, manifest = human_blind.build_pack(
+            self.result, self.jobs, self.drafts, self.blind_key, seed=20260818
+        )
+        return human_blind.BlindTestRun(
+            public, private, manifest,
+            self.drafts / "human-test-progress.json",
+            self.drafts / "human-test-result.json",
+        )
+
+    def answer_remaining(self, run):
+        for item in run.snapshot()["items"]:
+            if item["item_id"] != "item-01":
+                run.save_answer(item["item_id"], "right", "legalább tíz karakter")
+
+    def answer_all(self, run):
+        for item in run.snapshot()["items"]:
+            run.save_answer(item["item_id"], "left", "legalább tíz karakter")
+
+    def test_answer_requires_known_item_choice_and_reason(self):
+        run = self.make_run()
+        with self.assertRaisesRegex(ValueError, "reason"):
+            run.save_answer("item-01", "left", "rövid")
+        with self.assertRaisesRegex(ValueError, "choice"):
+            run.save_answer("item-01", "engine_v3", "legalább tíz karakter")
+
+    def test_candidate_notes_are_bounded_and_unblinded_to_the_correct_system(self):
+        run = self.make_run()
+        with self.assertRaisesRegex(ValueError, "500"):
+            run.save_answer("item-01", "left", "legalább tíz karakter",
+                            left_highlight="x" * 501)
+        run.save_answer("item-01", "left", "legalább tíz karakter",
+                        left_highlight="ez a sor tetszett",
+                        left_note="feszes és természetes",
+                        right_note="jó kép, de modoros")
+        self.answer_remaining(run)
+        item = run.finalize()["items"][0]
+        self.assertEqual(item["candidate_feedback"]["engine_v3"]["highlight"],
+                         "ez a sor tetszett")
+
+    def test_finalize_is_blocked_until_complete_then_becomes_immutable(self):
+        run = self.make_run()
+        with self.assertRaisesRegex(RuntimeError, "30"):
+            run.finalize()
+        self.answer_all(run)
+        result = run.finalize()
+        self.assertEqual(sum(result["overall"].values()), 30)
+        self.assertFalse(result["utility_written"])
+        self.assertFalse(result["learned_preference_claimed"])
+        self.assertTrue(result["feedback_review_required"])
+        self.assertNotIn("left_text", json.dumps(result, ensure_ascii=False))
+        self.assertTrue(all("draft_hashes" in item for item in result["items"]))
+        with self.assertRaisesRegex(RuntimeError, "finalized"):
+            run.save_answer("item-01", "right", "utólag már nem írható át")
+
+    def test_loopback_api_persists_answers_and_returns_http_contracts(self):
+        server_spec = importlib.util.spec_from_file_location("human_blind_test_server", SERVER_PATH)
+        server_module = importlib.util.module_from_spec(server_spec)
+        assert server_spec.loader is not None
+        server_spec.loader.exec_module(server_module)
+        httpd = server_module.ThreadingHTTPServer(
+            ("127.0.0.1", 0), server_module.make_handler(self.make_run())
+        )
+        worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+        worker.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=5)
+            connection.request("GET", "/api/test")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            public = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(public["answered_count"], 0)
+            self.assertNotIn("engine_v3", json.dumps(public, ensure_ascii=False))
+
+            connection.request("GET", "/api/results")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 409)
+            response.read()
+
+            payload = json.dumps({
+                "item_id": "item-01", "choice": "left", "reason": "legalább tíz karakter"
+            }, ensure_ascii=False).encode("utf-8")
+            connection.request("POST", "/api/answer", payload, {"Content-Type": "application/json"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.read().decode("utf-8"))["answered_count"], 1)
+
+            connection.request("POST", "/api/finalize", b"{}", {"Content-Type": "application/json"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 409)
+            response.read()
+            connection.request("GET", "/unknown")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 404)
+            response.read()
+            connection.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            worker.join(timeout=5)
+
+    def test_server_rejects_non_loopback_host(self):
+        completed = subprocess.run(
+            [
+                sys.executable, str(SERVER_PATH), "--public", "public.json", "--private", "private.json",
+                "--manifest", "manifest.json", "--progress", "progress.json", "--result", "result.json",
+                "--host", "0.0.0.0",
+            ],
+            capture_output=True,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("127.0.0.1", completed.stderr.decode(errors="replace"))
 
 
 if __name__ == "__main__":
