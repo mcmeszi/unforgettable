@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Emberi vakteszt</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Ugrás a tartalomhoz</a>
+  <header class="masthead" aria-label="Teszt állapota">
+    <strong>EMBERI VAKTESZT</strong>
+    <span id="header-progress">0 / 30</span>
+    <span id="save-status" role="status" aria-live="polite">Helyi értékelés</span>
+  </header>
+  <div class="progress-track" aria-hidden="true"><span id="progress-bar"></span></div>
+
+  <main id="main-content" tabindex="-1">
+    <section id="loading-view" class="centered-view" data-view="loading" aria-labelledby="loading-title">
+      <p class="eyebrow">ELŐKÉSZÍTÉS</p>
+      <h1 id="loading-title">A vakteszt betöltése…</h1>
+      <p>Kérlek, várj egy pillanatot.</p>
+    </section>
+
+    <section id="error-view" class="centered-view" data-view="error" hidden aria-labelledby="error-title">
+      <p class="eyebrow">HIBA</p>
+      <h1 id="error-title">A teszt most nem érhető el</h1>
+      <p id="error-message" role="alert"></p>
+      <button id="retry-button" class="button button-primary" type="button">Újrapróbálás</button>
+    </section>
+
+    <section id="start-view" class="centered-view intro" data-view="start" hidden aria-labelledby="start-title">
+      <p class="eyebrow">EGY ÉRTÉKELŐ · 30 ÖSSZEHASONLÍTÁS</p>
+      <h1 id="start-title">Olvasd el. Vesd össze. Indokold meg.</h1>
+      <p>Két névtelen szöveget kapsz minden briefhez. A rendszerek neve és az összesítés csak a teljes teszt véglegesítése után válik láthatóvá.</p>
+      <ul>
+        <li>A Bal és Jobb jelölt minden képernyőn azonos súlyt kap.</li>
+        <li>Minden döntéshez legalább 10 karakteres indoklás kell.</li>
+        <li>A válaszokat helyben, lépésenként mentjük.</li>
+      </ul>
+      <button id="start-button" class="button button-primary" type="button">Teszt indítása</button>
+    </section>
+
+    <section id="compare-view" data-view="compare" hidden aria-labelledby="compare-title">
+      <h1 id="compare-title" class="visually-hidden">Szövegek összehasonlítása</h1>
+      <details class="brief" open>
+        <summary><span>FELADATBRIEF</span><span class="summary-action">Részletek</span></summary>
+        <p id="brief-text"></p>
+      </details>
+
+      <form id="answer-form" novalidate>
+        <div class="reading-grid">
+          <article class="candidate" aria-labelledby="left-heading">
+            <h2 id="left-heading">BAL</h2>
+            <div id="left-candidate" class="candidate-prose"></div>
+            <div class="field">
+              <label for="left-highlight">Kiemelt részlet (opcionális)</label>
+              <textarea id="left-highlight" maxlength="500" rows="2"></textarea>
+            </div>
+            <div class="field">
+              <label for="left-note">Pozitív megjegyzés (opcionális)</label>
+              <textarea id="left-note" maxlength="1500" rows="2"></textarea>
+            </div>
+          </article>
+
+          <article class="candidate" aria-labelledby="right-heading">
+            <h2 id="right-heading">JOBB</h2>
+            <div id="right-candidate" class="candidate-prose"></div>
+            <div class="field">
+              <label for="right-highlight">Kiemelt részlet (opcionális)</label>
+              <textarea id="right-highlight" maxlength="500" rows="2"></textarea>
+            </div>
+            <div class="field">
+              <label for="right-note">Pozitív megjegyzés (opcionális)</label>
+              <textarea id="right-note" maxlength="1500" rows="2"></textarea>
+            </div>
+          </article>
+        </div>
+
+        <fieldset class="decision-gate">
+          <legend>DÖNTÉS</legend>
+          <div class="choice-group">
+            <label><input type="radio" name="choice" value="left"> <span>Bal</span></label>
+            <label><input type="radio" name="choice" value="right"> <span>Jobb</span></label>
+            <label><input type="radio" name="choice" value="tie"> <span>Döntetlen</span></label>
+          </div>
+          <div class="field">
+            <label for="reason">Indoklás (kötelező, legalább 10 karakter)</label>
+            <textarea id="reason" required minlength="10" maxlength="2000" rows="3" aria-describedby="reason-help"></textarea>
+            <p id="reason-help" class="field-help">A döntés és a legalább 10 karakteres indoklás után léphetsz tovább.</p>
+          </div>
+          <div class="field">
+            <label for="general-note">Általános megjegyzés (opcionális)</label>
+            <textarea id="general-note" maxlength="1500" rows="2"></textarea>
+          </div>
+        </fieldset>
+
+        <nav class="step-navigation" aria-label="Összehasonlítás léptetése">
+          <button id="back-button" class="button button-secondary" type="button">Vissza</button>
+          <span id="item-progress" aria-live="polite">1 / 30</span>
+          <button id="next-button" class="button button-primary" type="submit" disabled>Mentés és tovább</button>
+        </nav>
+      </form>
+    </section>
+
+    <section id="review-view" class="review-view" data-view="review" hidden aria-labelledby="review-title">
+      <p class="eyebrow">ELLENŐRZÉS</p>
+      <h1 id="review-title">Minden döntés mentve</h1>
+      <p>A véglegesítés után megjelennek a rendszernevek és az összesített eredmények. A válaszok ezután már nem módosíthatók.</p>
+      <div id="review-items" class="review-items" aria-label="Mentett válaszok"></div>
+      <div class="review-actions">
+        <button id="review-back-button" class="button button-secondary" type="button">Utolsó válasz ellenőrzése</button>
+        <button id="finalize-button" class="button button-primary" type="button">Véglegesítés és eredmények</button>
+      </div>
+    </section>
+
+    <section id="finalized-view" class="results-view" data-view="finalized" hidden aria-labelledby="results-title">
+      <p class="eyebrow">VÉGLEGESÍTVE</p>
+      <h1 id="results-title">A vakteszt eredménye</h1>
+      <p>Az alábbi nézet már feloldja a rendszerneveket. Az értékelés lezárt és nem módosítható.</p>
+      <div id="overall-results" class="overall-results"></div>
+      <h2>Tételes eredmények és visszajelzések</h2>
+      <div id="item-results" class="item-results"></div>
+    </section>
+  </main>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

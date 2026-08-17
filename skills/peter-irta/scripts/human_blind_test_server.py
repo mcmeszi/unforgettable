@@ -11,6 +11,14 @@ from pathlib import Path
 from human_blind_test import BlindTestRun
 
 
+ASSET_ROOT = Path(__file__).resolve().parents[1] / "assets" / "human-blind-test"
+PUBLIC_ASSETS = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+}
+
+
 def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
@@ -28,6 +36,22 @@ def make_handler(run: BlindTestRun) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_asset(self, filename: str, content_type: str) -> None:
+            try:
+                body = (ASSET_ROOT / filename).read_bytes()
+            except OSError:
+                self._send_json(404, {"error": "not found"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             self.wfile.write(body)
 
@@ -65,6 +89,14 @@ def make_handler(run: BlindTestRun) -> type[BaseHTTPRequestHandler]:
             }
 
         def do_GET(self) -> None:  # noqa: N802 - stdlib HTTP callback name
+            if self.path == "/favicon.ico":
+                self.send_response(204)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            if self.path in PUBLIC_ASSETS:
+                self._send_asset(*PUBLIC_ASSETS[self.path])
+                return
             if self.path == "/api/test":
                 self._send_json(200, run.snapshot())
                 return

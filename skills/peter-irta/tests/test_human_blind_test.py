@@ -1,6 +1,7 @@
 import importlib.util
 import http.client
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,7 @@ sys.path.insert(0, str(SCRIPTS))
 MODULE_PATH = SCRIPTS / "human_blind_test.py"
 PREPARER_PATH = SCRIPTS / "prepare_human_blind_test.py"
 SERVER_PATH = SCRIPTS / "human_blind_test_server.py"
+ASSET_ROOT = Path(__file__).resolve().parents[1] / "assets" / "human-blind-test"
 SPEC = importlib.util.spec_from_file_location("human_blind_test", MODULE_PATH)
 human_blind = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -265,6 +267,120 @@ class HumanBlindTestTests(unittest.TestCase):
             self.assertEqual(response.status, 409)
             response.read()
             connection.request("GET", "/unknown")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 404)
+            response.read()
+            connection.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            worker.join(timeout=5)
+
+    def test_frontend_assets_and_required_copy_exist(self):
+        html = (ASSET_ROOT / "index.html").read_text(encoding="utf-8")
+        styles = (ASSET_ROOT / "app.css").read_text(encoding="utf-8")
+        script = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+        for required in (
+            'id="left-candidate"', 'id="right-candidate"',
+            'id="left-highlight"', 'id="left-note"',
+            'id="right-highlight"', 'id="right-note"',
+            'id="general-note"', 'id="reason"',
+            'value="left"', 'value="right"', 'value="tie"',
+            "Véglegesítés",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, html)
+        for endpoint in ("/api/test", "/api/progress", "/api/answer", "/api/finalize", "/api/results"):
+            with self.subTest(endpoint=endpoint):
+                self.assertIn(endpoint, script)
+        for design_contract in (
+            "#F7F4EE", "#24211D", "#7A2E34",
+            "@media (max-width: 759px)", "prefers-reduced-motion",
+            ".step-navigation { position: static;",
+        ):
+            with self.subTest(design_contract=design_contract):
+                self.assertIn(design_contract, styles)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for frontend behavior validation")
+    def test_frontend_state_validation_and_answer_payload_contract(self):
+        node_program = r"""
+const app = require(process.argv[1]);
+const result = {
+  states: [
+    app.deriveState({started: false, finalized: false, answeredCount: 0, itemCount: 30}),
+    app.deriveState({started: true, finalized: false, answeredCount: 4, itemCount: 30}),
+    app.deriveState({started: true, finalized: false, answeredCount: 30, itemCount: 30}),
+    app.deriveState({started: true, finalized: true, answeredCount: 30, itemCount: 30})
+  ],
+  invalidMissingChoice: app.validateAnswer({choice: "", reason: "legalább tíz karakter"}),
+  invalidShortReason: app.validateAnswer({choice: "left", reason: " rövid "}),
+  validTie: app.validateAnswer({choice: "tie", reason: "  legalább tíz karakter  "}),
+  navigation: [
+    app.navigationAvailability({currentIndex: 0, busy: false}),
+    app.navigationAvailability({currentIndex: 1, busy: false}),
+    app.navigationAvailability({currentIndex: 1, busy: true})
+  ],
+  scrollBehavior: [app.scrollBehavior(false), app.scrollBehavior(true)],
+  payload: app.buildAnswerPayload("item-07", {
+    choice: "right", reason: "  legalább tíz karakter  ",
+    leftHighlight: " bal idézet ", leftNote: " bal jegyzet ",
+    rightHighlight: " jobb idézet ", rightNote: " jobb jegyzet ",
+    generalNote: " általános "
+  })
+};
+process.stdout.write(JSON.stringify(result));
+"""
+        completed = subprocess.run(
+            [shutil.which("node"), "-e", node_program, str(ASSET_ROOT / "app.js")],
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
+        result = json.loads(completed.stdout.decode("utf-8"))
+        self.assertEqual(result["states"], ["start", "compare", "review", "finalized"])
+        self.assertFalse(result["invalidMissingChoice"]["valid"])
+        self.assertFalse(result["invalidShortReason"]["valid"])
+        self.assertTrue(result["validTie"]["valid"])
+        self.assertEqual(result["navigation"], [
+            {"backEnabled": False}, {"backEnabled": True}, {"backEnabled": False},
+        ])
+        self.assertEqual(result["scrollBehavior"], ["smooth", "auto"])
+        self.assertEqual(result["payload"], {
+            "item_id": "item-07", "choice": "right", "reason": "legalább tíz karakter",
+            "flags": [], "left_highlight": "bal idézet", "left_note": "bal jegyzet",
+            "right_highlight": "jobb idézet", "right_note": "jobb jegyzet",
+            "general_note": "általános",
+        })
+
+    def test_loopback_server_serves_only_the_frontend_asset_contract(self):
+        server_spec = importlib.util.spec_from_file_location("human_blind_test_server", SERVER_PATH)
+        server_module = importlib.util.module_from_spec(server_spec)
+        assert server_spec.loader is not None
+        server_spec.loader.exec_module(server_module)
+        httpd = server_module.ThreadingHTTPServer(
+            ("127.0.0.1", 0), server_module.make_handler(self.make_run())
+        )
+        worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+        worker.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=5)
+            expected = {
+                "/": ("text/html", "EMBERI VAKTESZT"),
+                "/app.css": ("text/css", "--paper"),
+                "/app.js": ("text/javascript", "/api/answer"),
+            }
+            for path, (content_type, marker) in expected.items():
+                with self.subTest(path=path):
+                    connection.request("GET", path)
+                    response = connection.getresponse()
+                    body = response.read().decode("utf-8")
+                    self.assertEqual(response.status, 200)
+                    self.assertIn(content_type, response.getheader("Content-Type"))
+                    self.assertIn(marker, body)
+            connection.request("GET", "/favicon.ico")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 204)
+            response.read()
+            connection.request("GET", "/../human_blind_test.py")
             response = connection.getresponse()
             self.assertEqual(response.status, 404)
             response.read()
