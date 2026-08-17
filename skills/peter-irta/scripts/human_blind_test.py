@@ -15,7 +15,7 @@ from threading import RLock
 ALLOWED_FLAGS = frozenset({"tie", "both_weak", "both_strong", "brief_problem", "unclear"})
 MAX_REASON_LENGTH = 2_000
 MAX_FEEDBACK_LENGTH = 500
-MAX_GENERAL_NOTE_LENGTH = 1_000
+MAX_NOTE_LENGTH = 1_500
 
 
 def canonical_sha256(payload: dict) -> str:
@@ -139,6 +139,30 @@ def validate_public_pack(pack: dict) -> list[str]:
     return errors
 
 
+def _validate_run_public_pack(pack: dict) -> list[str]:
+    """Validate the public schema without assuming a malformed run has 30 items."""
+    errors = []
+    items = pack.get("items") if isinstance(pack, dict) else None
+    if not isinstance(items, list) or not items:
+        return ["public pack must contain items"]
+    required = {"item_id", "brief_id", "genre", "brief", "left_text", "right_text", "draft_hashes"}
+    item_ids = [str(item.get("item_id", "")) for item in items if isinstance(item, dict)]
+    if len(item_ids) != len(items) or not all(item_ids) or len(set(item_ids)) != len(item_ids):
+        errors.append("public item IDs must be unique")
+    for item in items:
+        if not isinstance(item, dict) or set(item) != required:
+            errors.append("public items must contain only the required public fields")
+            break
+        if not all(isinstance(item[field], str) and item[field] for field in ("item_id", "brief_id", "genre", "brief", "left_text", "right_text")):
+            errors.append("public item text fields must be non-empty strings")
+            break
+        hashes = item["draft_hashes"]
+        if not isinstance(hashes, dict) or set(hashes) != {"left", "right"}:
+            errors.append("public items must include left and right draft hashes")
+            break
+    return errors
+
+
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -168,7 +192,7 @@ class BlindTestRun:
         self._items = {item["item_id"]: item for item in self.public["items"]}
 
     def _validate_inputs(self) -> None:
-        errors = validate_public_pack(self.public)
+        errors = _validate_run_public_pack(self.public)
         if errors:
             raise ValueError("invalid public pack: " + "; ".join(errors))
         if not isinstance(self.manifest, dict):
@@ -255,8 +279,8 @@ class BlindTestRun:
                 raise RuntimeError("test has already been finalized")
             if item_id not in self._items:
                 raise ValueError("unknown item")
-            if choice not in {"left", "right"}:
-                raise ValueError("choice must be left or right")
+            if choice not in {"left", "right", "tie"}:
+                raise ValueError("choice must be left, right, or tie")
             reason = self._bounded_text(reason, "reason", MAX_REASON_LENGTH)
             if len(reason) < 10:
                 raise ValueError("reason must be at least 10 characters")
@@ -274,9 +298,9 @@ class BlindTestRun:
                 "flags": normalized_flags,
                 "left_highlight": self._bounded_text(left_highlight, "left_highlight", MAX_FEEDBACK_LENGTH),
                 "right_highlight": self._bounded_text(right_highlight, "right_highlight", MAX_FEEDBACK_LENGTH),
-                "left_note": self._bounded_text(left_note, "left_note", MAX_FEEDBACK_LENGTH),
-                "right_note": self._bounded_text(right_note, "right_note", MAX_FEEDBACK_LENGTH),
-                "general_note": self._bounded_text(general_note, "general_note", MAX_GENERAL_NOTE_LENGTH),
+                "left_note": self._bounded_text(left_note, "left_note", MAX_NOTE_LENGTH),
+                "right_note": self._bounded_text(right_note, "right_note", MAX_NOTE_LENGTH),
+                "general_note": self._bounded_text(general_note, "general_note", MAX_NOTE_LENGTH),
                 "updated_at": _utc_timestamp(),
             }
             progress = self._load_progress()
@@ -301,20 +325,20 @@ class BlindTestRun:
             progress = self._load_progress()
             answers = progress["answers"]
             item_count = len(self._items)
-            if len(answers) != item_count or set(answers) != set(self._items):
-                raise RuntimeError(f"all {item_count} answers are required before finalization")
-            overall = {"legacy": 0, "engine_v3": 0}
+            if item_count != 30 or len(answers) != 30 or set(answers) != set(self._items):
+                raise RuntimeError("all 30 answers are required before finalization")
+            overall = {"legacy": 0, "engine_v3": 0, "tie": 0}
             by_genre: dict[str, dict[str, int]] = {}
             result_items = []
             for public_item in self.public["items"]:
                 item_id = public_item["item_id"]
                 answer = answers[item_id]
                 private_item = self.private["items"][item_id]
-                chosen_system = private_item[answer["choice"]]
-                overall[chosen_system] += 1
+                chosen_system = private_item[answer["choice"]] if answer["choice"] != "tie" else None
+                overall[chosen_system or "tie"] += 1
                 genre = public_item["genre"]
-                genre_totals = by_genre.setdefault(genre, {"legacy": 0, "engine_v3": 0})
-                genre_totals[chosen_system] += 1
+                genre_totals = by_genre.setdefault(genre, {"legacy": 0, "engine_v3": 0, "tie": 0})
+                genre_totals[chosen_system or "tie"] += 1
                 candidate_feedback = {
                     private_item["left"]: {
                         "highlight": answer["left_highlight"],

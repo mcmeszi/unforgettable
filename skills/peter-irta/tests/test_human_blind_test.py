@@ -129,6 +129,25 @@ class HumanBlindTestTests(unittest.TestCase):
             self.drafts / "human-test-result.json",
         )
 
+    def make_smaller_run(self):
+        public, private, _manifest = human_blind.build_pack(
+            self.result, self.jobs, self.drafts, self.blind_key, seed=20260818
+        )
+        item = public["items"][0]
+        smaller_public = {"schema_version": 1, "items": [item]}
+        smaller_private = {"schema_version": 1, "items": {item["item_id"]: private["items"][item["item_id"]]}}
+        smaller_manifest = {
+            "schema_version": 1,
+            "item_count": 1,
+            "public_sha256": human_blind.canonical_sha256(smaller_public),
+            "private_sha256": human_blind.canonical_sha256(smaller_private),
+        }
+        return human_blind.BlindTestRun(
+            smaller_public, smaller_private, smaller_manifest,
+            self.drafts / "small-progress.json",
+            self.drafts / "small-result.json",
+        )
+
     def answer_remaining(self, run):
         for item in run.snapshot()["items"]:
             if item["item_id"] != "item-01":
@@ -173,6 +192,41 @@ class HumanBlindTestTests(unittest.TestCase):
         self.assertTrue(all("draft_hashes" in item for item in result["items"]))
         with self.assertRaisesRegex(RuntimeError, "finalized"):
             run.save_answer("item-01", "right", "utólag már nem írható át")
+
+    def test_tie_finalization_keeps_both_systems_without_winner(self):
+        run = self.make_run()
+        run.save_answer("item-01", "tie", "legalább tíz karakter")
+        self.answer_remaining(run)
+        result = run.finalize()
+        item = next(item for item in result["items"] if item["item_id"] == "item-01")
+        self.assertIsNone(item["chosen_system"])
+        self.assertEqual(result["overall"]["tie"], 1)
+        self.assertEqual(result["overall"]["legacy"] + result["overall"]["engine_v3"], 29)
+        self.assertEqual(result["by_genre"][item["genre"]]["tie"], 1)
+
+    def test_candidate_and_general_notes_allow_1500_and_reject_1501_characters(self):
+        maximum_note = "x" * 1500
+        run = self.make_run()
+        snapshot = run.save_answer(
+            "item-01", "left", "legalább tíz karakter",
+            left_note=maximum_note, right_note=maximum_note, general_note=maximum_note,
+        )
+        answer = next(item["answer"] for item in snapshot["items"] if item["item_id"] == "item-01")
+        self.assertEqual(answer["left_note"], maximum_note)
+        self.assertEqual(answer["right_note"], maximum_note)
+        self.assertEqual(answer["general_note"], maximum_note)
+        for field in ("left_note", "right_note", "general_note"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "1500"):
+                    self.make_run().save_answer(
+                        "item-01", "left", "legalább tíz karakter", **{field: "x" * 1501}
+                    )
+
+    def test_finalize_requires_30_answers_for_a_complete_smaller_pack(self):
+        run = self.make_smaller_run()
+        run.save_answer("item-01", "left", "legalább tíz karakter")
+        with self.assertRaisesRegex(RuntimeError, "30"):
+            run.finalize()
 
     def test_loopback_api_persists_answers_and_returns_http_contracts(self):
         server_spec = importlib.util.spec_from_file_location("human_blind_test_server", SERVER_PATH)
