@@ -5,22 +5,18 @@
 Készüljön egyszemélyes, helyben futó böngészős vakteszt a V1 retrieval és az
 Engine v3 által generált szövegek emberi összehasonlítására. A teszt mérje a
 brief teljesítését, a műfaji természetességet és a Péter-hang hitelességét úgy,
-hogy a rendszerazonosság a tizenkét döntés véglegesítéséig ne jelenjen meg.
+hogy a rendszerazonosság mind a harminc döntés véglegesítéséig ne jelenjen meg.
 
-Ez a kör pilot. Eredménye emberi evidencia, de önmagában nem tanítja a rerankert,
+Ez egy teljes, egyszemélyes emberi benchmarkkör. Eredménye emberi evidencia, de önmagában nem tanítja a rerankert,
 és nem ír automatikusan retrieval-utility vagy voice-feedback ledgert.
 
 ## Mintaválasztás
 
-- Pontosan 12 különböző brief kerüljön a tesztbe.
-- Mind a 10 benchmark-műfajból szerepeljen legalább egy brief.
-- Műfajonként elsőként a legtöbb instabil AB/BA bírópárral rendelkező briefet
-  válassza a preparáló. Holtversenyben a brief ID lexikografikus sorrendje döntsön.
-- A fennmaradó két helyre a még ki nem választott, legtöbb instabil párral
-  rendelkező brief kerüljön, azonos determinisztikus holtverseny-felbontással.
+- Pontosan mind a 30 benchmark-brief kerüljön a tesztbe.
+- Mind a 10 benchmark-műfajból pontosan három brief szerepeljen.
 - Egy brief egyszer jelenjen meg. Fordított sorrendű ismétlés ne legyen.
 - Fix, parancssorból megadható seed határozza meg a sorrendet és az oldalakat.
-- Az Engine v3 pontosan hat esetben legyen bal, hat esetben jobb oldalon.
+- Az Engine v3 pontosan 15 esetben legyen bal, 15 esetben jobb oldalon.
 
 A public test pack csak a briefet, műfajt, két szöveget és átlátszatlan test-ID-t
 tartalmazza. Nem tartalmazhat `legacy`, `engine_v3`, `A`, `B`, source-ID vagy
@@ -59,7 +55,7 @@ Feladatai:
 - a public pack átadása;
 - válaszok szerveroldali, atomikus mentése;
 - hiányos válasz és korai finalizálás elutasítása;
-- a private key feloldása kizárólag a 12 válasz véglegesítése után;
+- a private key feloldása kizárólag a 30 válasz véglegesítése után;
 - az emberi benchmark eredményének JSON-exportja.
 
 A szerver ne indítson modellhívást, ne írjon utility ledgert, és ne módosítsa a
@@ -81,7 +77,7 @@ Egy fókuszált, editorial jellegű összehasonlító felület készüljön:
 - előre és vissza navigálás, mentett állapot visszatöltése;
 - haladásjelző, de futás közbeni pontszám vagy rendszerutalás nélkül;
 - véglegesítés előtt összefoglaló ellenőrzőképernyő;
-- véglegesítés után rendszerfeloldás, 12 döntés listája és összesített eredmény.
+- véglegesítés után rendszerfeloldás, 30 döntés listája és összesített eredmény.
 
 A frontend ne használjon külső fontot, analitikát, CDN-t vagy hálózati kérést.
 
@@ -92,7 +88,7 @@ A frontend ne használjon külső fontot, analitikát, CDN-t vagy hálózati ké
 3. Minden válasz mentése után a szerver ideiglenes fájlba ír, majd atomikusan
    lecseréli az aktív progress JSON-t.
 4. A frontend frissítés vagy újraindítás után a szervertől tölti vissza az állapotot.
-5. A finalizálás csak 12 érvényes döntés és indok mellett sikerül.
+5. A finalizálás csak 30 érvényes döntés és indok mellett sikerül.
 6. Sikeres finalizáláskor a szerver feloldja a pozíciókat, kiszámítja a
    brief-győzelmeket és kiírja a lezárt human result JSON-t.
 7. Finalizált futás nem módosítható. Újrakezdéshez új run-ID és új output kell.
@@ -114,7 +110,8 @@ Nyers draftszöveg ne kerüljön az eredményfájlba; csak draft-hash és test-I
 ## Hibakezelés és biztonsági kapuk
 
 - Hiányzó vagy módosult inputhash esetén a szerver ne induljon el.
-- Duplikált brief, nem 12 elem, hiányzó műfaj vagy nem 6/6 rendszerpozíció
+- Duplikált brief, nem 30 elem, műfajonként nem három brief vagy nem 15/15
+  rendszerpozíció
   preparálási hiba.
 - Ismeretlen döntés, rövid indok vagy ismeretlen test-ID HTTP 400.
 - Korai reveal/finalize HTTP 409.
@@ -126,8 +123,8 @@ Nyers draftszöveg ne kerüljön az eredményfájlba; csak draft-hash és test-I
 
 Automatizált tesztek fedjék le:
 
-- a determinisztikus, műfajkiegyensúlyozott 12-es kiválasztást;
-- a 6/6 Engine-oldal invariánst;
+- a determinisztikus, mind a 30 briefet megtartó sorrendet;
+- a műfajonkénti 3-as lefedettséget és a 15/15 Engine-oldal invariánst;
 - a public pack rendszer- és source-ID-mentességét;
 - a hash-ellenőrzést;
 - az érvényes és érvénytelen answer contractot;
@@ -136,7 +133,7 @@ Automatizált tesztek fedjék le:
 - azt, hogy utility és learned preference nem íródik.
 
 Vizuális QA desktop és mobil nézetben szükséges. A fő útvonalat böngészőben végig
-kell kattintani: kezdés → válaszmentés → visszatöltés → 12. döntés → finalizálás →
+kell kattintani: kezdés → válaszmentés → visszatöltés → 30. döntés → finalizálás →
 feloldott összesítés.
 
 ## Nem része ennek az egységnek
