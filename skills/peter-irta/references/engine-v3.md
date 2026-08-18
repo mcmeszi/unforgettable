@@ -93,7 +93,16 @@ vagy modellhívást. Emiatt ehhez a lépéshez a `MIND_VAULT_RAG_ROOT` nem kell.
 Csak akkor állítsd be, ha az előző fejezet retrieval-benchmarkját is újragenerálod:
 
 ```powershell
-$env:MIND_VAULT_RAG_ROOT = (Resolve-Path ".\data\mind-vault\rag").Path
+$repoRootText = git rev-parse --show-toplevel 2>$null
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRootText)) {
+  throw "A parancsot a kisagy Git-repón belül futtasd."
+}
+$repoRoot = [IO.Path]::GetFullPath($repoRootText.Trim())
+$ragRoot = Join-Path $repoRoot "data\mind-vault\rag"
+if (-not (Test-Path -LiteralPath $ragRoot -PathType Container)) {
+  throw "Nem található RAG-gyökér: $ragRoot"
+}
+$env:MIND_VAULT_RAG_ROOT = $ragRoot
 ```
 
 A jelenlegi aggregált `benchmark-results.json` a 30 briefet `briefs` alatt
@@ -106,7 +115,11 @@ forrás azonos ID-/műfajkészletét. Candidate mappinget, source ID-t és
 provenance-adatot nem másol a kompatibilitási fájlba.
 
 ```powershell
-$repoRoot = (Resolve-Path ".").Path
+$repoRootText = git rev-parse --show-toplevel 2>$null
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRootText)) {
+  throw "A parancsot a kisagy Git-repón belül futtasd."
+}
+$repoRoot = [IO.Path]::GetFullPath($repoRootText.Trim())
 $skillRoot = Join-Path $repoRoot "skills\peter-irta"
 $runtimeSkillRoot = Join-Path $env:USERPROFILE ".codex\skills\peter-irta"
 $benchmarkRoot = Join-Path $runtimeSkillRoot "state\engine-v3-generation-benchmark"
@@ -173,6 +186,14 @@ Az elkészült tesztet kizárólag loopbacken indítsd. A szerver a kiválasztot
 szabad portot JSON-ként kiírja; azt nyisd meg `http://127.0.0.1:<port>/` címen.
 
 ```powershell
+$repoRootText = git rev-parse --show-toplevel 2>$null
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRootText)) {
+  throw "A parancsot a kisagy Git-repón belül futtasd."
+}
+$repoRoot = [IO.Path]::GetFullPath($repoRootText.Trim())
+$skillRoot = Join-Path $repoRoot "skills\peter-irta"
+$humanTestRoot = Join-Path $skillRoot "state\human-blind-test-30"
+
 python "$skillRoot\scripts\human_blind_test_server.py" `
   --public "$humanTestRoot\public-test.json" `
   --private "$humanTestRoot\private-human-key.json" `
