@@ -9,6 +9,19 @@
     results: "/api/results"
   });
 
+  const FLAG_LABELS = Object.freeze({
+    brief_mismatch: "Brief-tévesztés",
+    genre_mismatch: "Műfajidegenség",
+    false_peter_voice: "Hamis Péter-hang",
+    mannerism_caricature: "Modorosság / karikatúra",
+    hard_guard_problem: "Hard-guard probléma"
+  });
+
+  function normalizeFlags(values) {
+    if (!Array.isArray(values)) return [];
+    return Array.from(new Set(values.filter((value) => Object.hasOwn(FLAG_LABELS, value))));
+  }
+
   function deriveState({ started, finalized, answeredCount, itemCount }) {
     if (finalized) return "finalized";
     if (!started) return "start";
@@ -33,7 +46,7 @@
       item_id: itemId,
       choice: fields.choice,
       reason: clean(fields.reason),
-      flags: [],
+      flags: normalizeFlags(fields.flags),
       left_highlight: clean(fields.leftHighlight),
       left_note: clean(fields.leftNote),
       right_highlight: clean(fields.rightHighlight),
@@ -62,7 +75,7 @@
   }
 
   const publicApi = {
-    deriveState, validateAnswer, buildAnswerPayload, navigationAvailability,
+    deriveState, validateAnswer, buildAnswerPayload, normalizeFlags, navigationAvailability,
     scrollBehavior, focusTargetForState
   };
   if (typeof module !== "undefined" && module.exports) module.exports = publicApi;
@@ -179,6 +192,10 @@
     if (answer) {
       const radio = document.querySelector(`input[name="choice"][value="${answer.choice}"]`);
       if (radio) radio.checked = true;
+      for (const flag of normalizeFlags(answer.flags)) {
+        const checkbox = document.querySelector(`input[name="flags"][value="${flag}"]`);
+        if (checkbox) checkbox.checked = true;
+      }
       elements.reason.value = answer.reason || "";
       elements["left-highlight"].value = answer.left_highlight || "";
       elements["left-note"].value = answer.left_note || "";
@@ -194,6 +211,10 @@
     return {
       choice: choice ? choice.value : "",
       reason: elements.reason.value,
+      flags: Array.from(
+        document.querySelectorAll('input[name="flags"]:checked'),
+        (checkbox) => checkbox.value
+      ),
       leftHighlight: elements["left-highlight"].value,
       leftNote: elements["left-note"].value,
       rightHighlight: elements["right-highlight"].value,
@@ -269,6 +290,14 @@
     return node;
   }
 
+  function flagsParagraph(flags) {
+    const labels = normalizeFlags(flags).map((flag) => FLAG_LABELS[flag]);
+    return paragraph(
+      labels.length ? `Hibajelölések: ${labels.join(", ")}` : "",
+      "Nincs hibajelölés."
+    );
+  }
+
   function renderResults() {
     elements["overall-results"].replaceChildren();
     for (const [system, count] of Object.entries(state.results.overall || {})) {
@@ -297,7 +326,7 @@
         section.append(heading, paragraph(notes.highlight, "Nincs kiemelt részlet."), paragraph(notes.note));
         feedback.append(section);
       }
-      article.append(title, decision, feedback, paragraph(item.general_note));
+      article.append(title, decision, flagsParagraph(item.flags), feedback, paragraph(item.general_note));
       elements["item-results"].append(article);
     }
     setView("finalized");

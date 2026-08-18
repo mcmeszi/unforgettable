@@ -85,6 +85,16 @@
             <label><input type="radio" name="choice" value="right"> <span>Jobb</span></label>
             <label><input type="radio" name="choice" value="tie"> <span>Döntetlen</span></label>
           </div>
+          <div class="flags-field" role="group" aria-labelledby="flags-label">
+            <p id="flags-label" class="field-label">Hibajelölések (opcionális)</p>
+            <div class="flag-group">
+              <label><input type="checkbox" name="flags" value="brief_mismatch"> <span>Brief-tévesztés</span></label>
+              <label><input type="checkbox" name="flags" value="genre_mismatch"> <span>Műfajidegenség</span></label>
+              <label><input type="checkbox" name="flags" value="false_peter_voice"> <span>Hamis Péter-hang</span></label>
+              <label><input type="checkbox" name="flags" value="mannerism_caricature"> <span>Modorosság / karikatúra</span></label>
+              <label><input type="checkbox" name="flags" value="hard_guard_problem"> <span>Hard-guard probléma</span></label>
+            </div>
+          </div>
           <div class="field">
             <label for="reason">Indoklás (kötelező, legalább 10 karakter)</label>
             <textarea id="reason" required minlength="10" maxlength="2000" rows="3" aria-describedby="reason-help"></textarea>

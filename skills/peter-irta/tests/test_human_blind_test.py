@@ -141,6 +141,7 @@ class HumanBlindTestTests(unittest.TestCase):
         smaller_manifest = {
             "schema_version": 1,
             "item_count": 1,
+            "seed": 20260818,
             "public_sha256": human_blind.canonical_sha256(smaller_public),
             "private_sha256": human_blind.canonical_sha256(smaller_private),
         }
@@ -165,6 +166,32 @@ class HumanBlindTestTests(unittest.TestCase):
             run.save_answer("item-01", "left", "rövid")
         with self.assertRaisesRegex(ValueError, "choice"):
             run.save_answer("item-01", "engine_v3", "legalább tíz karakter")
+
+    def test_only_design_error_flags_are_accepted_and_survive_finalization(self):
+        expected_flags = [
+            "brief_mismatch",
+            "genre_mismatch",
+            "false_peter_voice",
+            "mannerism_caricature",
+            "hard_guard_problem",
+        ]
+        run = self.make_run()
+        snapshot = run.save_answer(
+            "item-01", "left", "legalább tíz karakter", flags=expected_flags,
+        )
+        answer = next(item["answer"] for item in snapshot["items"] if item["item_id"] == "item-01")
+        self.assertEqual(answer["flags"], expected_flags)
+
+        for unsupported in ("tie", "both_weak", "both_strong", "brief_problem", "unclear", "other"):
+            with self.subTest(unsupported=unsupported):
+                with self.assertRaisesRegex(ValueError, "unsupported"):
+                    self.make_run().save_answer(
+                        "item-01", "left", "legalább tíz karakter", flags=[unsupported],
+                    )
+
+        self.answer_remaining(run)
+        result_item = run.finalize()["items"][0]
+        self.assertEqual(result_item["flags"], expected_flags)
 
     def test_candidate_notes_are_bounded_and_unblinded_to_the_correct_system(self):
         run = self.make_run()
@@ -194,6 +221,38 @@ class HumanBlindTestTests(unittest.TestCase):
         self.assertTrue(all("draft_hashes" in item for item in result["items"]))
         with self.assertRaisesRegex(RuntimeError, "finalized"):
             run.save_answer("item-01", "right", "utólag már nem írható át")
+
+    def test_final_result_has_manifest_seed_and_stable_output_bound_run_id(self):
+        run = self.make_run()
+        self.answer_all(run)
+        result = run.finalize()
+        self.assertEqual(result["seed"], 20260818)
+        self.assertRegex(result["run_id"], r"^hbt-[0-9a-f]{24}$")
+        self.assertNotIn(str(self.drafts), result["run_id"])
+        self.assertEqual(self.make_run().finalized_result()["run_id"], result["run_id"])
+
+        public, private, manifest = human_blind.build_pack(
+            self.result, self.jobs, self.drafts, self.blind_key, seed=20260818
+        )
+        other = human_blind.BlindTestRun(
+            public, private, manifest,
+            self.drafts / "other-progress.json",
+            self.drafts / "other-result.json",
+        )
+        self.answer_all(other)
+        self.assertNotEqual(other.finalize()["run_id"], result["run_id"])
+
+    def test_run_rejects_manifest_without_seed(self):
+        public, private, manifest = human_blind.build_pack(
+            self.result, self.jobs, self.drafts, self.blind_key, seed=20260818
+        )
+        manifest.pop("seed")
+        with self.assertRaisesRegex(ValueError, "seed"):
+            human_blind.BlindTestRun(
+                public, private, manifest,
+                self.drafts / "missing-seed-progress.json",
+                self.drafts / "missing-seed-result.json",
+            )
 
     def test_tie_finalization_keeps_both_systems_without_winner(self):
         run = self.make_run()
@@ -287,6 +346,11 @@ class HumanBlindTestTests(unittest.TestCase):
             'id="general-note"', 'id="reason"',
             'value="left"', 'value="right"', 'value="tie"',
             "Véglegesítés",
+            'value="brief_mismatch"', 'Brief-tévesztés',
+            'value="genre_mismatch"', 'Műfajidegenség',
+            'value="false_peter_voice"', 'Hamis Péter-hang',
+            'value="mannerism_caricature"', 'Modorosság / karikatúra',
+            'value="hard_guard_problem"', 'Hard-guard probléma',
         ):
             with self.subTest(required=required):
                 self.assertIn(required, html)
@@ -307,9 +371,10 @@ class HumanBlindTestTests(unittest.TestCase):
             with self.subTest(design_contract=design_contract):
                 self.assertIn(design_contract, styles)
 
-    def test_programmatic_view_headings_do_not_use_browser_default_focus_box(self):
+    def test_programmatic_view_heading_focus_rule_is_scoped_to_headings(self):
         styles = (ASSET_ROOT / "app.css").read_text(encoding="utf-8")
-        self.assertIn('[tabindex="-1"]:focus { outline: none; }', styles)
+        self.assertIn('h1[tabindex="-1"]:focus { outline: none; }', styles)
+        self.assertNotIn('\n[tabindex="-1"]:focus { outline: none; }', styles)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for frontend behavior validation")
     def test_frontend_state_validation_and_answer_payload_contract(self):
@@ -335,6 +400,7 @@ const result = {
     .map((view) => app.focusTargetForState(view)),
   payload: app.buildAnswerPayload("item-07", {
     choice: "right", reason: "  legalább tíz karakter  ",
+    flags: ["brief_mismatch", "hard_guard_problem"],
     leftHighlight: " bal idézet ", leftNote: " bal jegyzet ",
     rightHighlight: " jobb idézet ", rightNote: " jobb jegyzet ",
     generalNote: " általános "
@@ -362,7 +428,8 @@ process.stdout.write(JSON.stringify(result));
         ])
         self.assertEqual(result["payload"], {
             "item_id": "item-07", "choice": "right", "reason": "legalább tíz karakter",
-            "flags": [], "left_highlight": "bal idézet", "left_note": "bal jegyzet",
+            "flags": ["brief_mismatch", "hard_guard_problem"],
+            "left_highlight": "bal idézet", "left_note": "bal jegyzet",
             "right_highlight": "jobb idézet", "right_note": "jobb jegyzet",
             "general_note": "általános",
         })

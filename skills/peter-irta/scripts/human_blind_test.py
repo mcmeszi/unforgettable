@@ -12,7 +12,13 @@ from pathlib import Path
 from threading import RLock
 
 
-ALLOWED_FLAGS = frozenset({"tie", "both_weak", "both_strong", "brief_problem", "unclear"})
+ALLOWED_FLAGS = frozenset({
+    "brief_mismatch",
+    "genre_mismatch",
+    "false_peter_voice",
+    "mannerism_caricature",
+    "hard_guard_problem",
+})
 MAX_REASON_LENGTH = 2_000
 MAX_FEEDBACK_LENGTH = 500
 MAX_NOTE_LENGTH = 1_500
@@ -167,6 +173,23 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _derive_run_id(manifest: dict, progress_path: Path, result_path: Path) -> str:
+    """Create an opaque, stable ID for one pack and output-path pair."""
+    material = {
+        "schema": "human-blind-run-v1",
+        "public_sha256": manifest["public_sha256"],
+        "private_sha256": manifest["private_sha256"],
+        "seed": manifest["seed"],
+        "progress_path_sha256": hashlib.sha256(
+            str(progress_path.resolve(strict=False)).encode("utf-8")
+        ).hexdigest(),
+        "result_path_sha256": hashlib.sha256(
+            str(result_path.resolve(strict=False)).encode("utf-8")
+        ).hexdigest(),
+    }
+    return f"hbt-{canonical_sha256(material)[:24]}"
+
+
 def _atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -189,6 +212,8 @@ class BlindTestRun:
         self.result_path = Path(result_path)
         self._lock = RLock()
         self._validate_inputs()
+        self.seed = self.manifest["seed"]
+        self.run_id = _derive_run_id(self.manifest, self.progress_path, self.result_path)
         self._items = {item["item_id"]: item for item in self.public["items"]}
 
     def _validate_inputs(self) -> None:
@@ -199,6 +224,9 @@ class BlindTestRun:
             raise ValueError("manifest must be an object")
         if self.manifest.get("item_count") != len(self.public["items"]):
             raise ValueError("manifest item count does not match public pack")
+        seed = self.manifest.get("seed")
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            raise ValueError("manifest seed must be an integer")
         if self.manifest.get("public_sha256") != canonical_sha256(self.public):
             raise ValueError("public manifest hash mismatch")
         if self.manifest.get("private_sha256") != canonical_sha256(self.private):
@@ -214,6 +242,8 @@ class BlindTestRun:
         if not self.progress_path.exists():
             return {
                 "schema_version": 1,
+                "run_id": self.run_id,
+                "seed": self.seed,
                 "public_sha256": self.manifest["public_sha256"],
                 "created_at": _utc_timestamp(),
                 "answers": {},
@@ -222,7 +252,12 @@ class BlindTestRun:
             progress = json.loads(self.progress_path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"invalid progress file: {error}") from error
-        if not isinstance(progress, dict) or progress.get("public_sha256") != self.manifest["public_sha256"]:
+        if (
+            not isinstance(progress, dict)
+            or progress.get("public_sha256") != self.manifest["public_sha256"]
+            or progress.get("run_id") != self.run_id
+            or progress.get("seed") != self.seed
+        ):
             raise ValueError("progress does not belong to this public pack")
         answers = progress.get("answers")
         if not isinstance(answers, dict):
@@ -236,7 +271,12 @@ class BlindTestRun:
             result = json.loads(self.result_path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"invalid finalized result: {error}") from error
-        if not isinstance(result, dict) or result.get("public_sha256") != self.manifest["public_sha256"]:
+        if (
+            not isinstance(result, dict)
+            or result.get("public_sha256") != self.manifest["public_sha256"]
+            or result.get("run_id") != self.run_id
+            or result.get("seed") != self.seed
+        ):
             raise ValueError("finalized result does not belong to this public pack")
         return result
 
@@ -364,6 +404,8 @@ class BlindTestRun:
                 })
             result = {
                 "schema_version": 1,
+                "run_id": self.run_id,
+                "seed": self.seed,
                 "public_sha256": self.manifest["public_sha256"],
                 "private_sha256": self.manifest["private_sha256"],
                 "finalized_at": _utc_timestamp(),

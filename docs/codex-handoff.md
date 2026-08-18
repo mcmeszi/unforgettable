@@ -5,7 +5,7 @@ Frissítve: 2026-08-18
 ## Cél és aktuális mérföldkő
 
 A 30 briefes V1 retrieval vs Engine v3 emberi vakteszt teljes helyi alkalmazása
-elkészült és Task 5 böngészős QA-n átment. A valós, gitignore-olt 30-as pack
+elkészült és a Task 5 javítás utáni böngészős QA-n átment. A valós, gitignore-olt 30-as pack
 érintetlen; Péter fő futása friss, 0/30 válaszos és nincs finalizálva. A helyi
 szerver kizárólag `127.0.0.1:8766` címen fut.
 
@@ -19,7 +19,7 @@ Ha a szervert később újra kell indítani, ez a checkouttól független, öná
 PowerShell-parancs:
 
 ```powershell
-& 'C:\Users\Mészáros Péter\AppData\Local\Programs\Python\Python312\python.exe' 'C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\scripts\human_blind_test_server.py' --public 'C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\state\human-blind-test-30\public-test.json' --private 'C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\state\human-blind-test-30\private-human-key.json' --manifest 'C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\state\human-blind-test-30\human-test-manifest.json' --progress 'C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\state\human-blind-test-30\human-test-progress.json' --result 'C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\state\human-blind-test-30\human-test-result.json' --host 127.0.0.1 --port 8766
+Start-Process -FilePath 'C:\Users\Mészáros Péter\AppData\Local\Programs\Python\Python312\python.exe' -ArgumentList @('"C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\scripts\human_blind_test_server.py"','--public','"C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\state\human-blind-test-30\public-test.json"','--private','"C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\state\human-blind-test-30\private-human-key.json"','--manifest','"C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\state\human-blind-test-30\human-test-manifest.json"','--progress','"C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\state\human-blind-test-30\human-test-progress.json"','--result','"C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\state\human-blind-test-30\human-test-result.json"','--host','127.0.0.1','--port','8766') -WorkingDirectory 'C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy' -WindowStyle Hidden -PassThru
 ```
 
 Indítás előtt ellenőrizd, hogy a 8766-os porton nem fut már ugyanez a folyamat;
@@ -40,6 +40,11 @@ egyidejűleg csak egy szerver írhatja ezt a progress/result párt.
 - Minden `Mentés és tovább` kérés az összes választott és opcionális mezőt
   `/api/answer` útvonalon menti. A szerver ideiglenes fájlt ír, majd atomi
   cserével frissíti a progress JSON-t.
+- Az öt választható, strukturált hibajelölés pontosan:
+  `brief_mismatch` (Brief-tévesztés), `genre_mismatch` (Műfajidegenség),
+  `false_peter_voice` (Hamis Péter-hang), `mannerism_caricature`
+  (Modorosság / karikatúra), `hard_guard_problem` (Hard-guard probléma).
+  A korábbi, ettől eltérő flag-nevek nem támogatottak.
 - Reload/újraindítás után a kliens `/api/progress` útvonalról visszatölti a
   mentett döntést, indokot, flag-eket, mindkét jelölt kiemelését/jegyzetét és az
   általános megjegyzést.
@@ -49,6 +54,11 @@ egyidejűleg csak egy szerver írhatja ezt a progress/result párt.
   `C:\Users\Mészáros Péter\.codex\worktrees\3697\kisagy\skills\peter-irta\state\human-blind-test-30\human-test-result.json`
 - Finalizálás csak 30 érvényes válasznál lehetséges. Utána az eredmény
   immutable; minden további answer write HTTP 409.
+- A final result tartalmazza a manifest `seed` értékét és egy
+  `hbt-<24 hex>` alakú, evidence-safe `run_id`-t. A run ID determinisztikusan
+  a public/private pack-hashból, a seedből, valamint a feloldott progress- és
+  result-útvonalak SHA-256 ujjlenyomatából készül. Ugyanahhoz az output párhoz
+  stabil, más output párhoz eltérő, és nem fedi fel a nyers útvonalakat.
 - QA utáni fő állapot: `answered_count=0`, `finalized=false`; a fő progress- és
   result-fájl jelenleg nem létezik.
 
@@ -87,48 +97,50 @@ egyidejűleg csak egy szerver írhatja ezt a progress/result párt.
 
 ## Task 5 QA és javítás
 
-- A teljes fő útvonal valódi böngészőben futott: start, teljes első feedback,
-  mentés, reload, Back, 30/30 review, finalizálás, reveal és második írás
-  elutasítása.
+- A teljes disposable útvonal valódi böngészőben futott: start, teljes első
+  feedback, két hibajelölés, mentés, reload, Back, 30/30 review, finalizálás,
+  reveal és második írás elutasítása.
+- Az első tétel reload/Back után kizárólag a kiválasztott
+  `brief_mismatch` és `hard_guard_problem` flaget állította vissza; a másik
+  három nem lett kijelölve. A final result és a reveal nézet ugyanezt őrizte.
 - Az első tételben egyedi Bal/Jobb kiemelések és jegyzetek kerültek a disposable
   futásba. A privát kulcs alapján Bal=`engine_v3`, Jobb=`legacy`; a lezárt
   eredmény mindkét feedbacket a helyes rendszerhez kötötte.
 - A második írás HTTP 409-et adott: `test has already been finalized`.
 - Talált és javított UI-hiba: a programmatikusan fókuszált view-címeken Chromium
   alapértelmezett fekete focus-keretet rajzolt. Regressziós teszt készült, a
-  heading outline megszűnt, az aktív fókuszcél és az interaktív vezérlők
-  oxblood focus-jelzése megmaradt.
+  heading outline megszűnt; a szabály kizárólag
+  `h1[tabindex="-1"]` címekre vonatkozik, az interaktív vezérlők oxblood
+  focus-jelzése megmaradt.
 - Desktop mérés: 1536×1024 viewport, két 768 px-es azonos oszlop, nincs
   vízszintes overflow.
 - Mobil mérés: 390×844 viewport, Bal → Jobb sorrend, mindkettő 390 px, nincs
   vízszintes overflow.
-- Böngészőkonzol: 0 error, 0 warning.
+- A QA-ban látható egyetlen konzolhiba a szándékosan kiváltott HTTP 409; más
+  error/warning nem volt.
 
 Disposable bizonyítékok:
 
 - Progress:
-  `.superpowers\sdd\2026-08-18-human-blind-test\task-5-disposable-run\human-test-progress.json`
+  `.superpowers\sdd\2026-08-18-human-blind-test\task-5-fix-disposable-run\human-test-progress.json`
 - Final result:
-  `.superpowers\sdd\2026-08-18-human-blind-test\task-5-disposable-run\human-test-result.json`
+  `.superpowers\sdd\2026-08-18-human-blind-test\task-5-fix-disposable-run\human-test-result.json`
+- Disposable run ID: `hbt-d74adaed2bfb23d57bb4225f`; seed: `20260818`.
 - Disposable result SHA-256:
-  `57B7F42E76F2C9FC3DBB6115DFB42E1E42F5E16F08474BC5FEECF63E130DCFF0`
+  `DE90BA5DE3DBE278E8C40F3F46D813D98E02ECBB1854602D61B1DBE3B7E1F9A3`
 - QA riport:
   `.superpowers\sdd\2026-08-18-human-blind-test\task-5-report.md`
-- Pontos viewport bizonyíték:
-  `.superpowers\sdd\2026-08-18-human-blind-test\task-5-visual-evidence.json`
-- Finalizált DOM/console bizonyíték:
-  `.superpowers\sdd\2026-08-18-human-blind-test\task-5-browser-evidence.json`
-- Fő képek: `task-5-start-desktop-1536x1024.png`,
-  `task-5-compare-desktop-1536x1024.png`,
-  `task-5-compare-mobile-390x844-exact.png`,
-  `task-5-decision-mobile-390x844-exact.png`,
-  `task-5-review-mobile-fixed.png`, `task-5-finalized-desktop.png`,
-  `task-5-finalized-mobile.png`.
+- Browser/viewport/result bizonyíték:
+  `.superpowers\sdd\2026-08-18-human-blind-test\task-5-fix-browser-evidence.json`
+- Fő képek: `task-5-fix-flags-desktop-1536x1024.png`,
+  `task-5-fix-flags-mobile-390x844.png`,
+  `task-5-fix-finalized-desktop-1536x1024.png`,
+  `task-5-fix-finalized-mobile-390x844.png`.
 
 ## Friss validáció
 
 - `python -m unittest discover -s .\skills\peter-irta\tests -p 'test_*.py'`
-  → 63/63 PASS.
+  → 66/66 PASS.
 - `python -m py_compile (Get-ChildItem .\skills\peter-irta\scripts\*.py)`
   → exit 0.
 - `node --check .\skills\peter-irta\assets\human-blind-test\app.js`
@@ -136,6 +148,8 @@ Disposable bizonyítékok:
 - `quick_validate.py .\skills\peter-irta` → `Skill is valid!`, exit 0.
 - `git diff --check` → exit 0; csak az ismert Windows LF→CRLF figyelmeztetés.
 - A szerver listener ellenőrzése: kizárólag `127.0.0.1:8766`, külső bind nincs.
+  A javított kóddal, rejtett ablakban futó jelenlegi `python.exe` PID-je
+  `1540`; a gyökér URL HTTP 200-at ad.
 
 ## Kötelező értelmezési korlátok
 
