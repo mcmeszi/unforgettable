@@ -170,6 +170,14 @@ def rerank_execution_sources(portfolio: dict) -> dict:
     observed = 0
     for original_rank, item in enumerate(execution, start=1):
         source = source_by_id.get(str(item.get("id")), {})
+        technique_tags = list(source.get("technique_tags") or ["brief-specific mechanism"])
+        mechanism = technique_tags[0]
+        transfer_instruction = str(
+            source.get("transfer_instruction")
+            or item.get("transfer_instruction")
+            or item.get("use")
+            or f"Transfer the {mechanism} mechanism without copying source wording."
+        )
         utility = max(-0.75, min(0.75, float(source.get("utility_weight") or 0.0)))
         observed += int(abs(utility) > 0.0)
         distance = max(0.0, float(item.get("distance") or 0.0))
@@ -181,7 +189,9 @@ def rerank_execution_sources(portfolio: dict) -> dict:
                 "title": item.get("title"),
                 "channel": source.get("retrieval_channel", "content"),
                 "portfolio_role": source.get("portfolio_role"),
-                "mechanism": (source.get("technique_tags") or ["brief-specific mechanism"])[0],
+                "mechanism": mechanism,
+                "technique_tags": technique_tags,
+                "transfer_instruction": transfer_instruction,
                 "fit_score": round(fit, 4),
                 "utility_weight": round(utility, 4),
                 "preference_score": round(preference_score, 4),

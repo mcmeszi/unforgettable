@@ -31,12 +31,23 @@ def _execution_sources(packet: dict) -> list[dict]:
 def _public_evidence(packet: dict) -> list[dict]:
     evidence = []
     for index, source in enumerate(_execution_sources(packet), start=1):
+        raw_tags = source.get("technique_tags") or []
+        technique_tags = [raw_tags] if isinstance(raw_tags, str) else list(raw_tags)
+        mechanism = str(source.get("mechanism") or "").strip()
+        if not technique_tags and mechanism:
+            technique_tags = [mechanism]
+        primary_mechanism = mechanism or (str(technique_tags[0]) if technique_tags else "")
+        transfer_instruction = str(source.get("transfer_instruction") or "").strip()
+        if not transfer_instruction and primary_mechanism:
+            transfer_instruction = (
+                f"Transfer the {primary_mechanism} mechanism without copying source wording."
+            )
         evidence.append(
             {
                 "source_label": f"S{index}",
                 "channel": source.get("channel") or source.get("retrieval_channel"),
-                "technique_tags": source.get("technique_tags") or [],
-                "transfer_instruction": source.get("transfer_instruction", ""),
+                "technique_tags": technique_tags,
+                "transfer_instruction": transfer_instruction,
                 "evidence": source.get("evidence") or [],
             }
         )
@@ -101,7 +112,11 @@ def build_workflow(packet: dict, variation_seed: str = "") -> tuple[dict, dict]:
     private = {
         "schema_version": 1,
         "workflow_id": workflow_id,
-        "engine_run_id": packet.get("retrieval", {}).get("run_id") or packet.get("source_trace", {}).get("run_id"),
+        "engine_run_id": (
+            packet.get("retrieval_run_id")
+            or packet.get("retrieval", {}).get("run_id")
+            or packet.get("source_trace", {}).get("run_id")
+        ),
         "reranker_state": reranker.get("state", "cold-start"),
         "learned_preference_claimed": False,
         "source_linkage": [

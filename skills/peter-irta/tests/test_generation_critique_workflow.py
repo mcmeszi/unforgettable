@@ -11,6 +11,11 @@ workflow = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(workflow)
 
+ENGINE_SPEC = importlib.util.spec_from_file_location("mind_vault_engine_for_workflow_test", SCRIPTS / "mind_vault_engine.py")
+engine = importlib.util.module_from_spec(ENGINE_SPEC)
+assert ENGINE_SPEC.loader is not None
+ENGINE_SPEC.loader.exec_module(engine)
+
 
 def engine_packet(state="cold-start"):
     return {
@@ -40,6 +45,39 @@ def engine_packet(state="cold-start"):
     }
 
 
+def producer_portfolio():
+    return {
+        "run_id": "engine-run-actual",
+        "rag_root": "safe-rag",
+        "retrieval_confidence": {"level": "high"},
+        "selection_policy": {"method": "dual-channel"},
+        "portfolio_coverage": {"modes": ["spoken-performance"]},
+        "author_writing_sheet": {"dialogue_support": {"transfer_strength": "none"}},
+        "sources": [
+            {
+                "id": "alpha",
+                "title": "Első",
+                "retrieval_channel": "content",
+                "portfolio_role": "anchor",
+                "technique_tags": ["callback"],
+                "evidence": [{"text": "Biztonságos saját evidence."}],
+            }
+        ],
+        "contrastive_calibration": {
+            "execution_set": [
+                {
+                    "id": "alpha",
+                    "title": "Első",
+                    "distance": 0.1,
+                    "use": "Extract one transferable mechanism for this brief.",
+                }
+            ],
+            "contrast_set": [],
+        },
+        "cross_genre_bridges": [],
+    }
+
+
 class GenerationCritiqueWorkflowTests(unittest.TestCase):
     def test_workflow_is_deterministic_and_links_generation_to_critique(self):
         first, _ = workflow.build_workflow(engine_packet())
@@ -63,6 +101,32 @@ class GenerationCritiqueWorkflowTests(unittest.TestCase):
 
         self.assertEqual(private["reranker_state"], "cold-start")
         self.assertFalse(private["learned_preference_claimed"])
+
+    def test_actual_engine_packet_preserves_mechanism_and_run_provenance(self):
+        plan = engine.plan_brief("Írj rövid slamet egy elromlott kávéfőzőről.")
+        packet = engine.compile_engine_packet(producer_portfolio(), plan)
+
+        public, private = workflow.build_workflow(packet)
+        evidence = public["generation_job"]["evidence_sources"][0]
+
+        self.assertEqual(evidence["technique_tags"], ["callback"])
+        self.assertIn("mechanism", evidence["transfer_instruction"])
+        self.assertEqual(private["engine_run_id"], "engine-run-actual")
+
+    def test_legacy_singular_mechanism_packet_remains_consumable(self):
+        packet = engine_packet()
+        packet["retrieval_run_id"] = "legacy-engine-run"
+        packet["retrieval"].pop("run_id")
+        for source in packet["evidence_compiler"]["execution_evidence"]:
+            source["mechanism"] = source["technique_tags"][0]
+            source.pop("technique_tags")
+
+        public, private = workflow.build_workflow(packet)
+        first = public["generation_job"]["evidence_sources"][0]
+
+        self.assertEqual(first["technique_tags"], ["callback"])
+        self.assertIn("callback", first["transfer_instruction"])
+        self.assertEqual(private["engine_run_id"], "legacy-engine-run")
 
     def test_attached_draft_has_integrity_hash_but_feedback_stores_no_text(self):
         public, _ = workflow.build_workflow(engine_packet())

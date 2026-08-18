@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -22,6 +23,8 @@ Ne próbáld kitalálni a jelöltek mögötti rendszert. Kizárólag a kért JSO
 JOB JSON:
 {job}
 """
+
+BINDING_SCHEMA = "codex-job-output-binding/v1"
 
 SCHEMA = {
     "type": "object",
@@ -63,10 +66,52 @@ def valid(path: Path) -> bool:
         return False
 
 
+def canonical_job_model_hash(job: dict, model: str) -> str:
+    canonical = json.dumps(
+        {"job": job, "model": model},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def binding_path(output: Path) -> Path:
+    return output.with_name(f"{output.name}.meta.json")
+
+
+def reusable_output(output: Path, job: dict, model: str) -> bool:
+    if not valid(output):
+        return False
+    try:
+        binding = json.loads(binding_path(output).read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        binding.get("schema") == BINDING_SCHEMA
+        and binding.get("canonical_job_model_sha256") == canonical_job_model_hash(job, model)
+        and binding.get("output_sha256") == hashlib.sha256(output.read_bytes()).hexdigest()
+    )
+
+
+def write_binding(output: Path, job: dict, model: str) -> None:
+    binding = {
+        "schema": BINDING_SCHEMA,
+        "job_id": str(job["job_id"]),
+        "model": model,
+        "canonical_job_model_sha256": canonical_job_model_hash(job, model),
+        "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+    }
+    binding_path(output).write_text(
+        json.dumps(binding, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def run_job(job: dict, output_dir: Path, model: str, workdir: Path, schema_path: Path, stop_event: threading.Event) -> tuple[str, bool, str]:
     job_id = str(job["job_id"])
     output = output_dir / f"{job_id}.json"
-    if valid(output):
+    if reusable_output(output, job, model):
         return job_id, True, "skipped"
     if stop_event.is_set():
         return job_id, False, "batch-stopped-after-credit-exhaustion"
@@ -83,6 +128,10 @@ def run_job(job: dict, output_dir: Path, model: str, workdir: Path, schema_path:
         if "out of credits" in detail.casefold():
             stop_event.set()
         return job_id, False, detail
+    try:
+        write_binding(output, job, model)
+    except OSError as error:
+        return job_id, False, f"failed to persist output binding: {error}"
     return job_id, True, "generated"
 
 

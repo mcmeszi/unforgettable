@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -23,6 +24,8 @@ JOB JSON:
 {job}
 """
 
+BINDING_SCHEMA = "codex-job-output-binding/v1"
+
 
 def load_jobs(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
@@ -32,10 +35,52 @@ def valid_draft(path: Path) -> bool:
     return path.exists() and len(path.read_text(encoding="utf-8-sig").strip()) >= 40
 
 
+def canonical_job_model_hash(job: dict, model: str) -> str:
+    canonical = json.dumps(
+        {"job": job, "model": model},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def binding_path(output: Path) -> Path:
+    return output.with_name(f"{output.name}.meta.json")
+
+
+def reusable_output(output: Path, job: dict, model: str) -> bool:
+    if not valid_draft(output):
+        return False
+    try:
+        binding = json.loads(binding_path(output).read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        binding.get("schema") == BINDING_SCHEMA
+        and binding.get("canonical_job_model_sha256") == canonical_job_model_hash(job, model)
+        and binding.get("output_sha256") == hashlib.sha256(output.read_bytes()).hexdigest()
+    )
+
+
+def write_binding(output: Path, job: dict, model: str) -> None:
+    binding = {
+        "schema": BINDING_SCHEMA,
+        "job_id": str(job["job_id"]),
+        "model": model,
+        "canonical_job_model_sha256": canonical_job_model_hash(job, model),
+        "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+    }
+    binding_path(output).write_text(
+        json.dumps(binding, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def run_job(job: dict, output_dir: Path, model: str, workdir: Path) -> tuple[str, bool, str]:
     job_id = str(job["job_id"])
     output = output_dir / f"{job_id}.md"
-    if valid_draft(output):
+    if reusable_output(output, job, model):
         return job_id, True, "skipped"
     executable = shutil.which("codex.cmd") or shutil.which("codex")
     if not executable:
@@ -69,6 +114,10 @@ def run_job(job: dict, output_dir: Path, model: str, workdir: Path) -> tuple[str
     if completed.returncode != 0 or not valid_draft(output):
         error = (completed.stderr or "missing or empty draft")[-1000:]
         return job_id, False, error
+    try:
+        write_binding(output, job, model)
+    except OSError as error:
+        return job_id, False, f"failed to persist output binding: {error}"
     return job_id, True, "generated"
 
 

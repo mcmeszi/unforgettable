@@ -60,8 +60,18 @@ def portfolio(transfer_strength="conditional", utility=0.0):
         ],
         "contrastive_calibration": {
             "execution_set": [
-                {"id": "one", "title": "Első", "distance": 0.2},
-                {"id": "two", "title": "Második", "distance": 0.1},
+                {
+                    "id": "one",
+                    "title": "Első",
+                    "distance": 0.2,
+                    "use": "Extract one transferable mechanism for this brief.",
+                },
+                {
+                    "id": "two",
+                    "title": "Második",
+                    "distance": 0.1,
+                    "use": "Extract one transferable mechanism for this brief.",
+                },
             ],
             "contrast_set": [{"id": "three", "title": "Más tartomány", "distance": 0.8}],
         },
@@ -127,6 +137,22 @@ class EnginePacketTests(unittest.TestCase):
         self.assertEqual(packet["preference_reranker"]["state"], "observed")
         self.assertEqual(ranked[0]["id"], "one")
         self.assertEqual({item["id"] for item in ranked}, {"one", "two"})
+
+    def test_execution_evidence_preserves_the_transfer_contract(self):
+        plan = engine.plan_brief("Írj slamet.")
+        packet = engine.compile_engine_packet(portfolio(), plan)
+        evidence = next(
+            item
+            for item in packet["evidence_compiler"]["execution_evidence"]
+            if item["id"] == "one"
+        )
+
+        self.assertEqual(evidence["mechanism"], "direct-address")
+        self.assertEqual(evidence.get("technique_tags"), ["direct-address"])
+        self.assertEqual(
+            evidence["transfer_instruction"],
+            "Extract one transferable mechanism for this brief.",
+        )
 
     def test_packet_keeps_four_channels_and_no_raw_slack_payload(self):
         plan = engine.plan_brief("Írj válasz emailt.")
