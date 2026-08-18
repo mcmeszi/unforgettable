@@ -307,6 +307,10 @@ class HumanBlindTestTests(unittest.TestCase):
             with self.subTest(design_contract=design_contract):
                 self.assertIn(design_contract, styles)
 
+    def test_programmatic_view_headings_do_not_use_browser_default_focus_box(self):
+        styles = (ASSET_ROOT / "app.css").read_text(encoding="utf-8")
+        self.assertIn('[tabindex="-1"]:focus { outline: none; }', styles)
+
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for frontend behavior validation")
     def test_frontend_state_validation_and_answer_payload_contract(self):
         node_program = r"""
