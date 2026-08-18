@@ -73,6 +73,25 @@ def make_handler(run: BlindTestRun) -> type[BaseHTTPRequestHandler]:
                 raise ValueError("request body must be a JSON object")
             return payload
 
+        def _active_origin(self) -> tuple[str, str]:
+            host, port = self.server.server_address[:2]
+            authority = str(host) if port == 80 else f"{host}:{port}"
+            return authority, f"http://{authority}"
+
+        def _validate_mutation_request(self) -> bool:
+            authority, origin = self._active_origin()
+            if self.headers.get("Host", "").strip().lower() != authority.lower():
+                self._send_json(403, {"error": "request Host does not match the active loopback server"})
+                return False
+            request_origin = self.headers.get("Origin")
+            if request_origin is not None and request_origin.strip().lower() != origin.lower():
+                self._send_json(403, {"error": "cross-origin mutation is forbidden"})
+                return False
+            if self.headers.get_content_type().lower() != "application/json":
+                self._send_json(415, {"error": "Content-Type must be application/json"})
+                return False
+            return True
+
         @staticmethod
         def _progress_payload() -> dict:
             snapshot = run.snapshot()
@@ -116,6 +135,8 @@ def make_handler(run: BlindTestRun) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802 - stdlib HTTP callback name
             if self.path not in {"/api/answer", "/api/finalize"}:
                 self._send_json(404, {"error": "not found"})
+                return
+            if not self._validate_mutation_request():
                 return
             try:
                 payload = self._read_json()

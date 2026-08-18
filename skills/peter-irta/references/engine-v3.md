@@ -105,14 +105,13 @@ if (-not (Test-Path -LiteralPath $ragRoot -PathType Container)) {
 $env:MIND_VAULT_RAG_ROOT = $ragRoot
 ```
 
-A jelenlegi aggregált `benchmark-results.json` a 30 briefet `briefs` alatt
-tartalmazza, míg a vakteszt-preparáló `generation_jobs` nevű kompatibilitási
-nézetet vár. Az alábbi PowerShell-blokk ezt a minimális, gitignore-olt nézetet
-reprodukálhatóan állítja elő: az ID-t és a műfajt az aggregált eredményből, a
-brief szövegét a publikus generálási jobokból veszi. A blokk ellenőrzi a 30
-egyedi ID-t, a műfajonkénti három briefet, a 60 jobot, az A/B párt és a két
-forrás azonos ID-/műfajkészletét. Candidate mappinget, source ID-t és
-provenance-adatot nem másol a kompatibilitási fájlba.
+A vakteszt-preparáló közvetlenül fogadja az aggregált
+`evaluation\benchmark-results.json` hivatalos, `briefs` alatti alakját. Az ID-t
+és a műfajt ebből ellenőrzi, a publikus brief szövegét pedig a meglévő
+`generation-jobs.jsonl` azonos A/B párjából kapcsolja hozzá. Külön
+kompatibilitási JSON nem kell. A preparáló ellenőrzi a 30 egyedi ID-t, a
+műfajonkénti három briefet, a 60 jobot, az A/B párokat, az azonos briefszöveget,
+valamint a result/job ID- és műfajegyezést.
 
 ```powershell
 $repoRootText = git rev-parse --show-toplevel 2>$null
@@ -124,54 +123,9 @@ $skillRoot = Join-Path $repoRoot "skills\peter-irta"
 $runtimeSkillRoot = Join-Path $env:USERPROFILE ".codex\skills\peter-irta"
 $benchmarkRoot = Join-Path $runtimeSkillRoot "state\engine-v3-generation-benchmark"
 $humanTestRoot = Join-Path $skillRoot "state\human-blind-test-30"
-$compatInput = Join-Path $skillRoot "state\human-blind-test-30-input.json"
-
-$benchmark = Get-Content -Raw -LiteralPath `
-  (Join-Path $benchmarkRoot "evaluation\benchmark-results.json") | ConvertFrom-Json
-$resultRows = @($benchmark.briefs)
-$jobs = @(Get-Content -LiteralPath (Join-Path $benchmarkRoot "generation-jobs.jsonl") |
-  Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
-
-if ($resultRows.Count -ne 30 -or
-    @($resultRows.brief_id | Sort-Object -Unique).Count -ne 30) {
-  throw "A benchmarkeredményben nem 30 egyedi brief van."
-}
-$genreCounts = @($resultRows | Group-Object genre)
-if ($genreCounts.Count -ne 10 -or
-    @($genreCounts | Where-Object Count -ne 3).Count -ne 0) {
-  throw "A benchmarkeredmény nem 10 műfaj × 3 brief."
-}
-$jobGroups = @($jobs | Group-Object brief_id)
-if ($jobs.Count -ne 60 -or $jobGroups.Count -ne 30 -or
-    @($jobGroups | Where-Object Count -ne 2).Count -ne 0) {
-  throw "A generálási jobok nem 30 darab kétjelöltes párt alkotnak."
-}
-if (Compare-Object @($resultRows.brief_id | Sort-Object) @($jobGroups.Name | Sort-Object)) {
-  throw "A benchmarkeredmény és a generálási jobok brief-ID készlete eltér."
-}
-
-$compatRows = foreach ($row in $resultRows) {
-  $matching = @($jobs | Where-Object brief_id -eq $row.brief_id)
-  $candidates = @($matching.candidate | Sort-Object -Unique)
-  $genres = @($matching.genre | Sort-Object -Unique)
-  $briefs = @($matching.brief | Sort-Object -Unique)
-  if (($candidates -join ",") -ne "A,B" -or
-      $genres.Count -ne 1 -or $genres[0] -ne $row.genre -or
-      $briefs.Count -ne 1 -or [string]::IsNullOrWhiteSpace($briefs[0])) {
-    throw "Eltérő A/B jobadat: $($row.brief_id)"
-  }
-  [ordered]@{
-    brief_id = [string]$row.brief_id
-    genre = [string]$row.genre
-    brief = [string]$briefs[0]
-  }
-}
-[ordered]@{ generation_jobs = @($compatRows) } |
-  ConvertTo-Json -Depth 4 |
-  Set-Content -LiteralPath $compatInput -Encoding utf8
 
 python "$skillRoot\scripts\prepare_human_blind_test.py" `
-  --results "$compatInput" `
+  --results "$benchmarkRoot\evaluation\benchmark-results.json" `
   --jobs "$benchmarkRoot\generation-jobs.jsonl" `
   --drafts-dir "$benchmarkRoot\drafts" `
   --blind-key "$benchmarkRoot\blind-key.json" `
@@ -198,11 +152,17 @@ python "$skillRoot\scripts\human_blind_test_server.py" `
   --public "$humanTestRoot\public-test.json" `
   --private "$humanTestRoot\private-human-key.json" `
   --manifest "$humanTestRoot\human-test-manifest.json" `
-  --progress "$humanTestRoot\progress.json" `
-  --result "$humanTestRoot\human-result.json" `
+  --progress "$humanTestRoot\human-test-progress.json" `
+  --result "$humanTestRoot\human-test-result.json" `
   --host 127.0.0.1 `
   --port 0
 ```
+
+A mutációs végpontok csak `application/json` kérést fogadnak, a `Host`
+fejlécnek a tényleges `127.0.0.1:<port>` authorityval, a jelen levő `Origin`
+fejlécnek pedig ugyanennek a HTTP originjével kell egyeznie. Origin nélküli,
+helyi CLI-kérés megengedett, ha a Host pontos. Távoli bind, cross-origin írás
+és DNS-rebinding Host tilos.
 
 A 30 döntés véglegesítése emberi evidenciát hoz létre. Nem ír automatikusan
 retrieval-utility bejegyzést, nem állít elő voice-feedback ledgerbejegyzést, és

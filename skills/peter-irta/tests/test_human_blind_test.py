@@ -31,7 +31,13 @@ class HumanBlindTestTests(unittest.TestCase):
         ]
         self.result = self.benchmark_result()
         self.jobs = [
-            {"job_id": f"{brief_id}-{candidate}", "brief_id": brief_id, "candidate": candidate}
+            {
+                "job_id": f"{brief_id}-{candidate}",
+                "brief_id": brief_id,
+                "candidate": candidate,
+                "genre": self.genre_by_brief[brief_id],
+                "brief": f"{self.genre_by_brief[brief_id]} brief {int(brief_id.rsplit('-', 1)[1])}",
+            }
             for brief_id in self.genre_by_brief
             for candidate in ("A", "B")
         ]
@@ -56,8 +62,13 @@ class HumanBlindTestTests(unittest.TestCase):
             for number in range(1, 4):
                 brief_id = f"{genre}-{number:02d}"
                 self.genre_by_brief[brief_id] = genre
-                briefs.append({"brief_id": brief_id, "genre": genre, "brief": f"{genre} brief {number}"})
-        return {"generation_jobs": briefs}
+                briefs.append({
+                    "brief_id": brief_id,
+                    "genre": genre,
+                    "winner": "tie",
+                    "votes": {"legacy": 3, "engine_v3": 3},
+                })
+        return {"briefs": briefs}
 
     def test_selection_keeps_all_thirty_briefs_and_three_per_genre(self):
         selected = human_blind.benchmark_briefs(self.benchmark_result())
@@ -77,6 +88,19 @@ class HumanBlindTestTests(unittest.TestCase):
         for forbidden in ("legacy", "engine_v3", '"A"', '"B"', "source_id"):
             self.assertNotIn(forbidden, serialized)
         self.assertEqual(manifest["public_sha256"], human_blind.canonical_sha256(public))
+
+    def test_seeded_item_order_and_candidate_sides_use_independent_rng_streams(self):
+        public, private, _manifest = human_blind.build_pack(
+            self.result, self.jobs, self.drafts, self.blind_key, seed=20260818
+        )
+        side_sequence = [
+            private["items"][item["item_id"]]["left"]
+            for item in public["items"]
+        ]
+        self.assertEqual(Counter(side_sequence), {"engine_v3": 15, "legacy": 15})
+        self.assertEqual(set(side_sequence[:15]), {"engine_v3", "legacy"})
+        self.assertEqual(set(side_sequence[15:]), {"engine_v3", "legacy"})
+        self.assertNotEqual(side_sequence, ["engine_v3"] * 15 + ["legacy"] * 15)
 
     def test_preparer_writes_three_deterministic_json_files(self):
         result_path = self.drafts / "results.json"
@@ -99,6 +123,13 @@ class HumanBlindTestTests(unittest.TestCase):
             sorted(path.name for path in output_dir.iterdir()),
             ["human-test-manifest.json", "private-human-key.json", "public-test.json"],
         )
+        public = json.loads((output_dir / "public-test.json").read_text(encoding="utf-8"))
+        source_by_id = {job["brief_id"]: job for job in self.jobs}
+        self.assertTrue(all(
+            item["genre"] == source_by_id[item["brief_id"]]["genre"]
+            and item["brief"] == source_by_id[item["brief_id"]]["brief"]
+            for item in public["items"]
+        ))
 
     def test_preparer_refuses_to_overwrite_a_nonempty_output_directory(self):
         result_path = self.drafts / "results.json"
@@ -195,6 +226,7 @@ class HumanBlindTestTests(unittest.TestCase):
 
     def test_candidate_notes_are_bounded_and_unblinded_to_the_correct_system(self):
         run = self.make_run()
+        left_system = run.private["items"]["item-01"]["left"]
         with self.assertRaisesRegex(ValueError, "500"):
             run.save_answer("item-01", "left", "legalább tíz karakter",
                             left_highlight="x" * 501)
@@ -204,7 +236,7 @@ class HumanBlindTestTests(unittest.TestCase):
                         right_note="jó kép, de modoros")
         self.answer_remaining(run)
         item = run.finalize()["items"][0]
-        self.assertEqual(item["candidate_feedback"]["engine_v3"]["highlight"],
+        self.assertEqual(item["candidate_feedback"][left_system]["highlight"],
                          "ez a sor tetszett")
 
     def test_finalize_is_blocked_until_complete_then_becomes_immutable(self):
@@ -329,6 +361,64 @@ class HumanBlindTestTests(unittest.TestCase):
             response = connection.getresponse()
             self.assertEqual(response.status, 404)
             response.read()
+            connection.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            worker.join(timeout=5)
+
+    def test_loopback_mutations_reject_cross_origin_non_json_and_rebound_host_requests(self):
+        server_spec = importlib.util.spec_from_file_location("human_blind_test_server", SERVER_PATH)
+        server_module = importlib.util.module_from_spec(server_spec)
+        assert server_spec.loader is not None
+        server_spec.loader.exec_module(server_module)
+        run = self.make_run()
+        httpd = server_module.ThreadingHTTPServer(
+            ("127.0.0.1", 0), server_module.make_handler(run)
+        )
+        worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+        worker.start()
+        payload = json.dumps({
+            "item_id": "item-01", "choice": "left", "reason": "legalább tíz karakter"
+        }, ensure_ascii=False).encode("utf-8")
+        try:
+            hostile_cases = [
+                (
+                    {"Content-Type": "application/json", "Origin": "https://attacker.example"},
+                    403,
+                ),
+                ({"Content-Type": "text/plain"}, 415),
+                (
+                    {"Content-Type": "application/json", "Host": "attacker.example"},
+                    403,
+                ),
+                (
+                    {
+                        "Content-Type": "application/json",
+                        "Host": f"rebound.attacker.example:{httpd.server_port}",
+                    },
+                    403,
+                ),
+            ]
+            for headers, expected_status in hostile_cases:
+                with self.subTest(headers=headers):
+                    connection = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=5)
+                    connection.request("POST", "/api/answer", payload, headers)
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, expected_status)
+                    response.read()
+                    connection.close()
+            self.assertEqual(run.snapshot()["answered_count"], 0)
+
+            same_origin = f"http://127.0.0.1:{httpd.server_port}"
+            connection = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=5)
+            connection.request(
+                "POST", "/api/answer", payload,
+                {"Content-Type": "application/json; charset=utf-8", "Origin": same_origin},
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.read().decode("utf-8"))["answered_count"], 1)
             connection.close()
         finally:
             httpd.shutdown()

@@ -29,8 +29,15 @@ def canonical_sha256(payload: dict) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def _benchmark_rows(result: dict) -> list[dict]:
+    rows = list(result.get("briefs") or result.get("generation_jobs") or [])
+    if any(not isinstance(row, dict) for row in rows):
+        raise ValueError("benchmark briefs must be objects")
+    return rows
+
+
 def benchmark_briefs(result: dict) -> list[str]:
-    rows = list(result.get("generation_jobs") or [])
+    rows = _benchmark_rows(result)
     brief_ids = [str(row.get("brief_id", "")) for row in rows]
     if len(brief_ids) != 30 or len(set(brief_ids)) != 30 or any(not brief_id for brief_id in brief_ids):
         raise ValueError("benchmark must contain exactly 30 unique briefs")
@@ -40,11 +47,48 @@ def benchmark_briefs(result: dict) -> list[str]:
     return brief_ids
 
 
+def _public_brief_rows(result: dict, jobs: list[dict]) -> list[dict]:
+    """Join aggregate IDs/genres to public brief text from generation jobs."""
+    brief_ids = benchmark_briefs(result)
+    result_by_id = {str(row["brief_id"]): row for row in _benchmark_rows(result)}
+    jobs_by_brief: dict[str, list[dict]] = {}
+    for job in jobs:
+        jobs_by_brief.setdefault(str(job.get("brief_id", "")), []).append(job)
+    if set(jobs_by_brief) != set(brief_ids):
+        raise ValueError("benchmark results and generation jobs must contain the same brief IDs")
+
+    public_rows = []
+    for brief_id in brief_ids:
+        matching = jobs_by_brief[brief_id]
+        candidates = {str(job.get("candidate", "")) for job in matching}
+        genres = {str(job.get("genre", "")) for job in matching}
+        briefs = {str(job.get("brief", "")).strip() for job in matching}
+        result_genre = str(result_by_id[brief_id].get("genre", ""))
+        if len(matching) != 2 or candidates != {"A", "B"}:
+            raise ValueError(f"generation jobs must contain one A/B pair for {brief_id}")
+        if genres != {result_genre} or not result_genre:
+            raise ValueError(f"benchmark and generation job genres differ for {brief_id}")
+        if len(briefs) != 1 or not next(iter(briefs)):
+            raise ValueError(f"generation jobs must contain one non-empty brief for {brief_id}")
+        public_rows.append({
+            "brief_id": brief_id,
+            "genre": result_genre,
+            "brief": next(iter(briefs)),
+        })
+    return public_rows
+
+
+def _domain_rng(seed: int, domain: str) -> random.Random:
+    material = f"human-blind-test-v1:{seed}:{domain}".encode("utf-8")
+    derived_seed = int.from_bytes(hashlib.sha256(material).digest(), "big")
+    return random.Random(derived_seed)
+
+
 def balanced_positions(brief_ids: list[str], seed: int) -> dict[str, bool]:
     if len(brief_ids) != 30 or len(set(brief_ids)) != 30:
         raise ValueError("balanced positions require 30 unique brief IDs")
     shuffled = list(brief_ids)
-    random.Random(seed).shuffle(shuffled)
+    _domain_rng(seed, "candidate-positions").shuffle(shuffled)
     return {brief_id: index < 15 for index, brief_id in enumerate(shuffled)}
 
 
@@ -66,11 +110,12 @@ def build_pack(
     blind_key: dict,
     seed: int,
 ) -> tuple[dict, dict, dict]:
-    brief_ids = benchmark_briefs(result)
-    by_brief = {str(row["brief_id"]): row for row in result["generation_jobs"]}
+    public_briefs = _public_brief_rows(result, jobs)
+    brief_ids = [row["brief_id"] for row in public_briefs]
+    by_brief = {row["brief_id"]: row for row in public_briefs}
     engine_left = balanced_positions(brief_ids, seed)
     shuffled = list(brief_ids)
-    random.Random(seed).shuffle(shuffled)
+    _domain_rng(seed, "item-order").shuffle(shuffled)
     public_items = []
     private_items = {}
     for index, brief_id in enumerate(shuffled, start=1):
