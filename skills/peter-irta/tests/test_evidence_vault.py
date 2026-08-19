@@ -69,6 +69,59 @@ class EvidenceIdentityTests(unittest.TestCase):
 
 
 class RecordValidationTests(unittest.TestCase):
+    def test_voice_source_accepts_provenance_backed_own_source(self):
+        record = make_record(
+            evidence_type="voice_source",
+            authority="voice",
+            provenance={
+                "source_kind": "provenance_validated_own_source",
+                "origin": "drive-original",
+                "source_run_id": "rag-abc",
+                "source_item_id": "doc-01",
+                "brief_id": "source-doc-01",
+                "source_sha256": "a" * 64,
+                "parent_evidence_ids": [],
+            },
+        )
+
+        evidence_vault.validate_record(record)
+
+    def test_voice_source_rejects_generated_v1_draft_source_kind(self):
+        record = make_record(
+            evidence_type="voice_source",
+            authority="voice",
+            provenance={
+                "source_kind": "generated_v1_draft",
+                "origin": "drive-original",
+                "source_run_id": "v1-run",
+                "source_item_id": "draft-01",
+                "brief_id": "slam-01",
+                "source_sha256": "a" * 64,
+                "parent_evidence_ids": [],
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "voice_source provenance"):
+            evidence_vault.validate_record(record)
+
+    def test_voice_source_rejects_generated_engine_v3_draft_origin(self):
+        record = make_record(
+            evidence_type="voice_source",
+            authority="voice",
+            provenance={
+                "source_kind": "provenance_validated_own_source",
+                "origin": "engine_v3_draft",
+                "source_run_id": "engine-run",
+                "source_item_id": "draft-01",
+                "brief_id": "slam-01",
+                "source_sha256": "a" * 64,
+                "parent_evidence_ids": [],
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "voice_source provenance"):
+            evidence_vault.validate_record(record)
+
     def test_active_guard_requires_scope_and_parent(self):
         record = make_record(status="active", scope=[])
         record["provenance"]["parent_evidence_ids"] = []

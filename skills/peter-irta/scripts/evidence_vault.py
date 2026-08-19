@@ -30,6 +30,17 @@ ALLOWED_TRANSITIONS = {
 AUTHORITIES = {"voice", "genre_mechanism", "generation_guard", "evaluation_only", "utility_only"}
 CONFIDENCE_LEVELS = {"low", "medium", "high"}
 EVIDENCE_ID_RE = re.compile(r"^ev-[0-9a-f]{24}$")
+VOICE_SOURCE_KIND = "provenance_validated_own_source"
+VOICE_SOURCE_ORIGINS = {
+    "drive-original",
+    "drive-owned",
+    "author-drive",
+    "author-text",
+    "proven-drive-match",
+    "corrected-transcript",
+    "source-caption",
+    "source-description",
+}
 
 
 def canonical_sha256(value: object) -> str:
@@ -96,6 +107,12 @@ def validate_record(record: dict) -> None:
     source_sha256 = provenance["source_sha256"]
     if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
         raise ValueError("provenance.source_sha256 must be 64 lowercase hex characters")
+    if record["evidence_type"] == "voice_source":
+        if (
+            provenance["source_kind"] != VOICE_SOURCE_KIND
+            or provenance.get("origin") not in VOICE_SOURCE_ORIGINS
+        ):
+            raise ValueError("voice_source provenance must be a provenance-backed own source")
     parent_ids = provenance.get("parent_evidence_ids", [])
     _require_string_list(parent_ids, "provenance.parent_evidence_ids")
     if any(not EVIDENCE_ID_RE.fullmatch(item) for item in parent_ids):
