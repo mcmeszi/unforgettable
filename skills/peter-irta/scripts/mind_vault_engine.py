@@ -366,9 +366,17 @@ def _final_projection_error_location(
         record_by_id.setdefault(evidence_id, record)
         evidence_line_by_id.setdefault(evidence_id, line_number)
 
-    last_decision_line: dict[str, int] = {}
+    status_by_id = {
+        evidence_id: record["status"]
+        for evidence_id, record in record_by_id.items()
+    }
+    last_status_change_line: dict[str, int] = {}
     for line_number, decision in decision_rows:
-        last_decision_line[decision["evidence_id"]] = line_number
+        evidence_id = decision["evidence_id"]
+        next_status = decision["status"]
+        if status_by_id[evidence_id] != next_status:
+            last_status_change_line[evidence_id] = line_number
+        status_by_id[evidence_id] = next_status
 
     for evidence_id, record in record_by_id.items():
         evidence_line = evidence_line_by_id[evidence_id]
@@ -381,9 +389,9 @@ def _final_projection_error_location(
                     or effective_status[parent_id] not in {"pending_review", "active"}
                 ):
                     causal_decisions = [
-                        last_decision_line[item_id]
+                        last_status_change_line[item_id]
                         for item_id in (evidence_id, parent_id)
-                        if item_id in last_decision_line
+                        if item_id in last_status_change_line
                     ]
                     if causal_decisions:
                         return decision_path, max(causal_decisions)
@@ -391,8 +399,8 @@ def _final_projection_error_location(
 
         for superseded_id in record["supersedes"]:
             if effective_status.get(superseded_id) != "active":
-                if superseded_id in last_decision_line:
-                    return decision_path, last_decision_line[superseded_id]
+                if superseded_id in last_status_change_line:
+                    return decision_path, last_status_change_line[superseded_id]
                 return evidence_path, evidence_line
 
     if decision_rows:

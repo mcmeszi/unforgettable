@@ -665,6 +665,66 @@ class EngineCliTests(unittest.TestCase):
             self.assertIn(str(args.decision_ledger), message)
             self.assertIn("line 2", message)
 
+    def test_final_projection_error_ignores_related_noop_decision(self):
+        parent = observation()
+        parent["status"] = "retired"
+        child = active_derived("mechanism", 21, "Érvénytelen szülőkapcsolat.")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+            (root / "evidence.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in (parent, child)) + "\n",
+                encoding="utf-8",
+            )
+            (root / "decisions.jsonl").write_text(
+                json.dumps(decision(child["evidence_id"], "active")) + "\n",
+                encoding="utf-8",
+            )
+            args = cli_args(root)
+
+            with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                engine, "run_vault_query", return_value=portfolio()
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    engine.main()
+
+            message = str(raised.exception)
+            self.assertIn(str(args.evidence_ledger), message)
+            self.assertIn("line 2", message)
+
+    def test_final_projection_error_keeps_activation_line_after_noop(self):
+        parent = observation()
+        parent["status"] = "retired"
+        child = active_derived("mechanism", 22, "Aktivált, de érvénytelen szülőkapcsolat.")
+        child["status"] = "pending_review"
+        activation = decision(child["evidence_id"], "active")
+        noop = decision(child["evidence_id"], "active")
+        noop["decided_at"] = "2026-08-19T10:00:00Z"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+            (root / "evidence.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in (parent, child)) + "\n",
+                encoding="utf-8",
+            )
+            (root / "decisions.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in (activation, noop)) + "\n",
+                encoding="utf-8",
+            )
+            args = cli_args(root)
+
+            with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                engine, "run_vault_query", return_value=portfolio()
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    engine.main()
+
+            message = str(raised.exception)
+            self.assertIn(str(args.decision_ledger), message)
+            self.assertIn("line 1", message)
+
     def test_projection_errors_report_the_causal_ledger_row(self):
         base_observation = observation()
         conflicting_duplicate = observation()
