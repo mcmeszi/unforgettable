@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +29,79 @@ POLICY_PATH = Path(__file__).resolve().parents[1] / "references" / "evidence-pol
 DERIVED_KINDS = {"guard", "mechanism"}
 GUARD_LEVELS = {"hard", "soft"}
 DECISION_STATUSES = {"active", "rejected", "retired"}
+
+
+def _resolve_distinct_ledger_paths(evidence_path: Path, decision_path: Path) -> tuple[Path, Path]:
+    """Resolve both ledgers and reject aliases for the same underlying file."""
+    evidence_path = Path(evidence_path).expanduser().resolve(strict=False)
+    decision_path = Path(decision_path).expanduser().resolve(strict=False)
+    same_file = (
+        evidence_path == decision_path
+        or (
+            evidence_path.is_file()
+            and decision_path.is_file()
+            and os.path.samefile(evidence_path, decision_path)
+        )
+    )
+    if same_file:
+        raise ValueError("evidence and decision ledgers must be different files")
+    return evidence_path, decision_path
+
+
+class _LedgerTransactionLock:
+    """Cross-platform interprocess lock for one ordered ledger-pair transaction."""
+
+    def __init__(self, evidence_path: Path, decision_path: Path) -> None:
+        identity = canonical_sha256({
+            "evidence_ledger": str(evidence_path),
+            "decision_ledger": str(decision_path),
+        })
+        self.path = evidence_path.parent / f".curate-evidence-{identity}.lock"
+        self.file = None
+
+    def __enter__(self) -> "_LedgerTransactionLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = self.path.open("a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self.file.seek(0, os.SEEK_END)
+                if self.file.tell() == 0:
+                    self.file.write(b"\0")
+                    self.file.flush()
+                while True:
+                    try:
+                        self.file.seek(0)
+                        msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            self.file.close()
+            self.file = None
+            raise
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        assert self.file is not None
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self.file.seek(0)
+                msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.file.close()
+            self.file = None
 
 
 def _require_text(value: object, field: str) -> str:
@@ -273,8 +347,37 @@ def create_derived(
     activate: bool,
 ) -> dict:
     """Create derived evidence and optionally activate it after final-state validation."""
-    evidence_path = Path(evidence_path)
-    decision_path = Path(decision_path)
+    evidence_path, decision_path = _resolve_distinct_ledger_paths(evidence_path, decision_path)
+    with _LedgerTransactionLock(evidence_path, decision_path):
+        return _create_derived_locked(
+            evidence_path=evidence_path,
+            decision_path=decision_path,
+            kind=kind,
+            genres=genres,
+            scopes=scopes,
+            directive=directive,
+            guard_level=guard_level,
+            confidence=confidence,
+            basis=basis,
+            parent_ids=parent_ids,
+            activate=activate,
+        )
+
+
+def _create_derived_locked(
+    evidence_path: Path,
+    decision_path: Path,
+    kind: str,
+    genres: list[str],
+    scopes: list[str],
+    directive: str,
+    guard_level: str | None,
+    confidence: str,
+    basis: str,
+    parent_ids: list[str],
+    activate: bool,
+) -> dict:
+    """Run one create-derived transaction while its ledger pair is locked."""
     records = read_jsonl(evidence_path)
     decisions = read_jsonl(decision_path)
     current_state = _project(records, decisions)
@@ -307,24 +410,44 @@ def create_derived(
     return record
 
 
+def create_derived_from_selectors(
+    evidence_path: Path,
+    decision_path: Path,
+    parent_runs: list[str],
+    parent_briefs: list[str],
+    **kwargs: object,
+) -> dict:
+    """Resolve parent selectors and create a derived record in one locked transaction."""
+    evidence_path, decision_path = _resolve_distinct_ledger_paths(evidence_path, decision_path)
+    with _LedgerTransactionLock(evidence_path, decision_path):
+        records = read_jsonl(evidence_path)
+        parent_ids = resolve_parent_ids(records, parent_runs, parent_briefs)
+        return _create_derived_locked(
+            evidence_path=evidence_path,
+            decision_path=decision_path,
+            parent_ids=parent_ids,
+            **kwargs,
+        )
+
+
 def append_decision(evidence_path: Path, decision_path: Path, decision: dict) -> None:
     """Append one validated curation decision only after its final state is valid."""
-    evidence_path = Path(evidence_path)
-    decision_path = Path(decision_path)
-    records = read_jsonl(evidence_path)
-    decisions = read_jsonl(decision_path)
-    _project(records, decisions + [decision])
-    new_decision_bytes = _jsonl_bytes(
-        decision_path.read_bytes() if decision_path.is_file() else b"", [decision]
-    )
-    temporary_name = _write_bytes(decision_path, new_decision_bytes)
-    try:
-        os.replace(temporary_name, decision_path)
-    finally:
+    evidence_path, decision_path = _resolve_distinct_ledger_paths(evidence_path, decision_path)
+    with _LedgerTransactionLock(evidence_path, decision_path):
+        records = read_jsonl(evidence_path)
+        decisions = read_jsonl(decision_path)
+        _project(records, decisions + [decision])
+        new_decision_bytes = _jsonl_bytes(
+            decision_path.read_bytes() if decision_path.is_file() else b"", [decision]
+        )
+        temporary_name = _write_bytes(decision_path, new_decision_bytes)
         try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
+            os.replace(temporary_name, decision_path)
+        finally:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
 
 
 def _pending_rows(records: list[dict], decisions: list[dict]) -> list[dict]:
@@ -381,8 +504,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "list":
+            evidence_path, decision_path = _resolve_distinct_ledger_paths(
+                args.evidence_ledger, args.decision_ledger
+            )
             print(json.dumps(
-                _pending_rows(read_jsonl(args.evidence_ledger), read_jsonl(args.decision_ledger)),
+                _pending_rows(read_jsonl(evidence_path), read_jsonl(decision_path)),
                 ensure_ascii=False,
                 sort_keys=True,
             ))
@@ -393,11 +519,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(decision, ensure_ascii=False, sort_keys=True))
             return 0
 
-        records = read_jsonl(args.evidence_ledger)
-        parent_ids = resolve_parent_ids(records, args.parent_run, args.parent_brief)
-        record = create_derived(
+        record = create_derived_from_selectors(
             evidence_path=args.evidence_ledger,
             decision_path=args.decision_ledger,
+            parent_runs=args.parent_run,
+            parent_briefs=args.parent_brief,
             kind=args.type,
             genres=args.genre,
             scopes=args.scope,
@@ -405,7 +531,6 @@ def main(argv: list[str] | None = None) -> int:
             guard_level=args.guard_level,
             confidence=args.confidence,
             basis=args.basis,
-            parent_ids=parent_ids,
             activate=args.activate,
         )
         print(json.dumps(record, ensure_ascii=False, sort_keys=True))

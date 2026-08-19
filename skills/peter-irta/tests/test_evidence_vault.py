@@ -494,6 +494,137 @@ class CurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one"):
             curator.resolve_parent_ids([first], ["hbt-missing"], ["slam-missing"])
 
+    def test_same_resolved_ledger_path_is_rejected_without_changing_bytes(self):
+        observation = make_record(evidence_type="evaluation_observation", status="pending_review")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence_path, _ = write_ledgers(root, [observation], [])
+            alias_path = root / "nested" / ".." / "evidence.jsonl"
+            before = evidence_path.read_bytes()
+
+            with self.assertRaisesRegex(ValueError, "different files"):
+                curator.create_derived(
+                    evidence_path=evidence_path,
+                    decision_path=alias_path,
+                    kind="guard",
+                    genres=["slam"],
+                    scopes=["spoken_delivery"],
+                    directive="A slam legyen egyszeri hallásra követhető.",
+                    guard_level="hard",
+                    confidence="high",
+                    basis="Explicit human feedback.",
+                    parent_ids=[observation["evidence_id"]],
+                    activate=True,
+                )
+
+            self.assertEqual(evidence_path.read_bytes(), before)
+
+    def test_concurrent_create_derived_commands_preserve_both_transactions(self):
+        first = make_record(evidence_type="evaluation_observation", evidence_id="ev-" + "2" * 24)
+        first["provenance"]["source_run_id"] = "hbt-concurrent-a"
+        first["provenance"]["brief_id"] = "slam-concurrent-a"
+        second = make_record(evidence_type="evaluation_observation", evidence_id="ev-" + "3" * 24)
+        second["provenance"]["source_run_id"] = "hbt-concurrent-b"
+        second["provenance"]["brief_id"] = "slam-concurrent-b"
+        fillers = []
+        for number in range(4, 1204):
+            filler = make_record(
+                evidence_type="evaluation_observation",
+                evidence_id=f"ev-{number:024x}",
+            )
+            filler["provenance"]["source_run_id"] = f"hbt-filler-{number}"
+            filler["provenance"]["brief_id"] = f"slam-filler-{number}"
+            fillers.append(filler)
+        with tempfile.TemporaryDirectory() as directory:
+            evidence_path, decision_path = write_ledgers(Path(directory), [first, second, *fillers], [])
+            common = [
+                sys.executable,
+                str(CURATOR_PATH),
+                "create-derived",
+                "--evidence-ledger", str(evidence_path),
+                "--decision-ledger", str(decision_path),
+                "--type", "guard",
+                "--genre", "slam",
+                "--scope", "spoken_delivery",
+                "--guard-level", "hard",
+                "--confidence", "high",
+                "--basis", "Concurrent explicit feedback.",
+                "--activate",
+            ]
+            left = subprocess.Popen(
+                common + [
+                    "--directive", "Az első párhuzamos slam-szabály.",
+                    "--parent-run", first["provenance"]["source_run_id"],
+                    "--parent-brief", first["provenance"]["brief_id"],
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            right = subprocess.Popen(
+                common + [
+                    "--directive", "A második párhuzamos slam-szabály.",
+                    "--parent-run", second["provenance"]["source_run_id"],
+                    "--parent-brief", second["provenance"]["brief_id"],
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            left_stdout, left_stderr = left.communicate(timeout=30)
+            right_stdout, right_stderr = right.communicate(timeout=30)
+
+            self.assertEqual(left.returncode, 0, left_stderr)
+            self.assertEqual(right.returncode, 0, right_stderr)
+            self.assertTrue(left_stdout)
+            self.assertTrue(right_stdout)
+            state = evidence_vault.project_state(
+                evidence_vault.read_jsonl(evidence_path), evidence_vault.read_jsonl(decision_path)
+            )
+            derived = [item for item in state.values() if item["evidence_type"] == "guard"]
+            self.assertEqual(len(derived), 2)
+            self.assertTrue(all(item["status"] == "active" for item in derived))
+            self.assertEqual(len(evidence_vault.read_jsonl(decision_path)), 2)
+
+    def test_failed_create_command_releases_lock_for_the_next_command(self):
+        observation = make_record(evidence_type="evaluation_observation", status="pending_review")
+        with tempfile.TemporaryDirectory() as directory:
+            evidence_path, decision_path = write_ledgers(Path(directory), [observation], [])
+            common = [
+                sys.executable,
+                str(CURATOR_PATH),
+                "create-derived",
+                "--evidence-ledger", str(evidence_path),
+                "--decision-ledger", str(decision_path),
+                "--type", "guard",
+                "--genre", "slam",
+                "--scope", "spoken_delivery",
+                "--guard-level", "hard",
+                "--confidence", "high",
+                "--basis", "Explicit human feedback.",
+                "--parent-run", observation["provenance"]["source_run_id"],
+                "--parent-brief", observation["provenance"]["brief_id"],
+                "--activate",
+            ]
+            failed = subprocess.run(
+                common + ["--directive", "A slam szabálya.", "--scope", "unknown_scope"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+
+            valid = subprocess.run(
+                common + ["--directive", "A slam legyen egyszeri hallásra követhető."],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            self.assertEqual(len(evidence_vault.read_jsonl(decision_path)), 1)
+
 
 class HumanBlindImportTests(unittest.TestCase):
     def test_import_builds_pending_observation_without_side_mapping(self):
