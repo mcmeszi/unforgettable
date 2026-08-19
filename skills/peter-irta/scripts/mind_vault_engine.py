@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -14,7 +15,14 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from evidence_vault import load_policy, project_state, read_jsonl, select_evidence
+from evidence_vault import (
+    canonical_sha256,
+    load_policy,
+    project_state,
+    read_jsonl,
+    select_evidence,
+    validate_record,
+)
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +32,12 @@ EVIDENCE_LEDGER = SKILL_ROOT / "state" / "evidence-vault" / "evidence.jsonl"
 DECISION_LEDGER = SKILL_ROOT / "state" / "evidence-vault" / "decisions.jsonl"
 EVIDENCE_POLICY = SKILL_ROOT / "references" / "evidence-policy.json"
 ENGINE_SCHEMA = "mind-vault-engine-packet/v2"
+EVIDENCE_POLICY_SCHEMA = "mind-vault-evidence-policy/v1"
+POLICY_AUTHORITY_KEYS = {
+    "voice", "genre_mechanism", "generation_guard", "evaluation_only", "utility_only",
+}
+POLICY_CONFIDENCE_KEYS = {"low", "medium", "high"}
+POLICY_LIMIT_KEYS = {"voice", "mechanisms", "soft_guards"}
 
 GENRE_ALIASES = {
     "beszed": ("beszéd", "speech", "előadás", "előadói"),
@@ -242,6 +256,164 @@ def fallback_evidence_policy(state: str) -> dict:
     }
 
 
+def _policy_error(path: Path, field: str, detail: str) -> ValueError:
+    return ValueError(f"Invalid evidence policy at {path}: {field} {detail}")
+
+
+def _finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
+def validate_evidence_policy(policy: dict, path: Path) -> dict:
+    """Validate every policy v1 value consumed by evidence selection."""
+    if not isinstance(policy, dict):
+        raise _policy_error(path, "policy", "must be an object")
+    if policy.get("schema") != EVIDENCE_POLICY_SCHEMA:
+        raise _policy_error(path, "schema", f"must be {EVIDENCE_POLICY_SCHEMA}")
+    for field in ("policy_version", "state"):
+        if not isinstance(policy.get(field), str) or not policy[field].strip():
+            raise _policy_error(path, field, "must be a non-empty string")
+
+    for field, required_keys in (
+        ("authority_weights", POLICY_AUTHORITY_KEYS),
+        ("confidence_weights", POLICY_CONFIDENCE_KEYS),
+    ):
+        values = policy.get(field)
+        if not isinstance(values, dict):
+            raise _policy_error(path, field, "must be an object")
+        missing = sorted(required_keys - set(values))
+        if missing:
+            raise _policy_error(path, field, f"is missing required keys: {', '.join(missing)}")
+        for key, value in values.items():
+            if not _finite_number(value):
+                raise _policy_error(path, f"{field}.{key}", "must be a finite number")
+
+    limits = policy.get("selection_limits")
+    if not isinstance(limits, dict):
+        raise _policy_error(path, "selection_limits", "must be an object")
+    missing_limits = sorted(POLICY_LIMIT_KEYS - set(limits))
+    if missing_limits:
+        raise _policy_error(
+            path,
+            "selection_limits",
+            f"is missing required keys: {', '.join(missing_limits)}",
+        )
+    for key in sorted(POLICY_LIMIT_KEYS):
+        value = limits[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise _policy_error(path, f"selection_limits.{key}", "must be a positive integer")
+
+    for field in ("genre_exact_bonus", "genre_global_bonus", "scope_brief_match_bonus"):
+        if not _finite_number(policy.get(field)):
+            raise _policy_error(path, field, "must be a finite number")
+
+    allowed_scopes = policy.get("allowed_scopes")
+    if (
+        not isinstance(allowed_scopes, list)
+        or not allowed_scopes
+        or any(not isinstance(item, str) or not item.strip() for item in allowed_scopes)
+    ):
+        raise _policy_error(path, "allowed_scopes", "must be a non-empty list of non-empty strings")
+    if len(set(allowed_scopes)) != len(allowed_scopes):
+        raise _policy_error(path, "allowed_scopes", "must contain unique values")
+    return policy
+
+
+def load_validated_evidence_policy(path: Path) -> dict:
+    """Load policy with path-aware errors, then validate nested selector inputs."""
+    try:
+        policy = load_policy(path)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(f"Invalid evidence policy at {path}: {error}") from error
+    return validate_evidence_policy(policy, path)
+
+
+def _jsonl_rows(path: Path) -> tuple[list[dict], list[tuple[int, dict]]]:
+    records = read_jsonl(path)
+    if not path.is_file():
+        return records, []
+    line_numbers = [
+        number
+        for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1)
+        if line.strip()
+    ]
+    return records, list(zip(line_numbers, records))
+
+
+def _ledger_error(path: Path, line_number: int, error: ValueError) -> ValueError:
+    return ValueError(f"Invalid evidence ledger at {path} line {line_number}: {error}")
+
+
+def load_validated_evidence_ledgers(
+    evidence_path: Path,
+    decision_path: Path,
+) -> tuple[list[dict], list[dict]]:
+    """Read ledgers and project each causal row with path-and-line diagnostics."""
+    evidence_records, evidence_rows = _jsonl_rows(evidence_path)
+    evidence_decisions, decision_rows = _jsonl_rows(decision_path)
+    if not evidence_path.is_file() or not decision_path.is_file():
+        return evidence_records, evidence_decisions
+
+    content_by_id: dict[str, str] = {}
+    record_by_id: dict[str, dict] = {}
+    for line_number, record in evidence_rows:
+        try:
+            validate_record(record)
+        except ValueError as error:
+            raise _ledger_error(evidence_path, line_number, error) from error
+        evidence_id = record["evidence_id"]
+        content_hash = canonical_sha256(record)
+        if evidence_id in content_by_id and content_by_id[evidence_id] != content_hash:
+            error = ValueError(f"duplicate evidence_id with different canonical content: {evidence_id}")
+            raise _ledger_error(evidence_path, line_number, error) from error
+        content_by_id.setdefault(evidence_id, content_hash)
+        record_by_id.setdefault(evidence_id, record)
+
+    for line_number, record in evidence_rows:
+        if record["status"] == "active" and record["evidence_type"] in {"guard", "mechanism"}:
+            for parent_id in record["provenance"]["parent_evidence_ids"]:
+                parent = record_by_id.get(parent_id)
+                if parent is None:
+                    error = ValueError(f"active derived evidence has missing parent: {parent_id}")
+                    raise _ledger_error(evidence_path, line_number, error) from error
+                if (
+                    parent["evidence_type"] != "evaluation_observation"
+                    or parent["status"] not in {"pending_review", "active"}
+                ):
+                    error = ValueError(
+                        f"active derived evidence parent must be a pending or active evaluation_observation: {parent_id}"
+                    )
+                    raise _ledger_error(evidence_path, line_number, error) from error
+        for superseded_id in record["supersedes"]:
+            superseded = record_by_id.get(superseded_id)
+            if superseded is None:
+                error = ValueError(f"supersedes references missing evidence: {superseded_id}")
+                raise _ledger_error(evidence_path, line_number, error) from error
+            if superseded["status"] != "active":
+                error = ValueError(f"supersedes must reference active evidence: {superseded_id}")
+                raise _ledger_error(evidence_path, line_number, error) from error
+
+    try:
+        project_state(evidence_records, [])
+    except ValueError as error:
+        fallback_line = evidence_rows[-1][0]
+        raise _ledger_error(evidence_path, fallback_line, error) from error
+
+    applied_decisions: list[dict] = []
+    for line_number, decision in decision_rows:
+        try:
+            project_state(evidence_records, [*applied_decisions, decision])
+        except ValueError as error:
+            raise _ledger_error(decision_path, line_number, error) from error
+        applied_decisions.append(decision)
+    return evidence_records, evidence_decisions
+
+
 def derived_mechanism_transfer(item: dict) -> dict:
     """Adapt one sanitized selector result without carrying RAG source text."""
     return {
@@ -429,9 +601,11 @@ def main() -> int:
         evidence_policy = fallback_evidence_policy("disabled_explicitly")
     else:
         try:
-            evidence_policy = load_policy(args.evidence_policy)
-            evidence_records = read_jsonl(args.evidence_ledger)
-            evidence_decisions = read_jsonl(args.decision_ledger)
+            evidence_policy = load_validated_evidence_policy(args.evidence_policy)
+            evidence_records, evidence_decisions = load_validated_evidence_ledgers(
+                args.evidence_ledger,
+                args.decision_ledger,
+            )
         except ValueError as error:
             raise SystemExit(str(error)) from error
         if not args.evidence_ledger.is_file() or not args.decision_ledger.is_file():

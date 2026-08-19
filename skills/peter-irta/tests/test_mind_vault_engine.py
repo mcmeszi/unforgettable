@@ -29,7 +29,13 @@ def policy(state="manual_policy_cold_start"):
         "schema": "mind-vault-evidence-policy/v1",
         "policy_version": "test-policy-v1",
         "state": state,
-        "authority_weights": {"genre_mechanism": 0.7, "generation_guard": 0.7},
+        "authority_weights": {
+            "voice": 1.0,
+            "genre_mechanism": 0.7,
+            "generation_guard": 0.7,
+            "evaluation_only": 0.0,
+            "utility_only": 0.0,
+        },
         "confidence_weights": {"low": 0.1, "medium": 0.2, "high": 0.3},
         "selection_limits": {"voice": 5, "mechanisms": 3, "soft_guards": 3},
         "genre_exact_bonus": 0.5,
@@ -90,6 +96,17 @@ def active_derived(kind, number, directive, *, genre="slam", scope="spoken_deliv
         "confidence": {"level": "high", "basis": "test fixture"},
         "created_at": "2026-08-19T08:01:00Z",
         "supersedes": [],
+    }
+
+
+def decision(evidence_id, status):
+    return {
+        "schema": "mind-vault-evidence-decision/v1",
+        "evidence_id": evidence_id,
+        "status": status,
+        "reason": "test decision",
+        "curator": "peter",
+        "decided_at": "2026-08-19T09:00:00Z",
     }
 
 
@@ -370,6 +387,135 @@ class EngineCliTests(unittest.TestCase):
                     message = str(raised.exception)
                     self.assertIn(str(root / malformed_name), message)
                     self.assertIn("line 2", message)
+
+    def test_structurally_invalid_evidence_row_reports_exact_file_and_line(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+            (root / "evidence.jsonl").write_text("\n{}\n", encoding="utf-8")
+            (root / "decisions.jsonl").write_text("", encoding="utf-8")
+            args = cli_args(root)
+
+            with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                engine, "run_vault_query", return_value=portfolio()
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    engine.main()
+
+            message = str(raised.exception)
+            self.assertIn(str(args.evidence_ledger), message)
+            self.assertIn("line 2", message)
+
+    def test_structurally_invalid_decision_row_reports_exact_file_and_line(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+            (root / "evidence.jsonl").write_text(
+                json.dumps(observation(), ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            (root / "decisions.jsonl").write_text("\n\n{}\n", encoding="utf-8")
+            args = cli_args(root)
+
+            with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                engine, "run_vault_query", return_value=portfolio()
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    engine.main()
+
+            message = str(raised.exception)
+            self.assertIn(str(args.decision_ledger), message)
+            self.assertIn("line 3", message)
+
+    def test_projection_errors_report_the_causal_ledger_row(self):
+        base_observation = observation()
+        conflicting_duplicate = observation()
+        conflicting_duplicate["content"] = {"observation": "different"}
+        missing_parent = active_derived("mechanism", 8, "Hiányzó szülő.")
+        missing_superseded = active_derived("mechanism", 9, "Hiányzó előd.")
+        missing_superseded["supersedes"] = ["ev-" + "e" * 24]
+        cases = (
+            (
+                "duplicate",
+                [base_observation, conflicting_duplicate],
+                [],
+                "evidence.jsonl",
+                2,
+            ),
+            ("missing-parent", [missing_parent], [], "evidence.jsonl", 1),
+            (
+                "missing-superseded",
+                [base_observation, missing_superseded],
+                [],
+                "evidence.jsonl",
+                2,
+            ),
+            (
+                "invalid-transition",
+                [base_observation],
+                [decision(base_observation["evidence_id"], "retired")],
+                "decisions.jsonl",
+                1,
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+            for name, records, decisions, ledger_name, expected_line in cases:
+                with self.subTest(error=name):
+                    (root / "evidence.jsonl").write_text(
+                        "\n".join(json.dumps(item) for item in records) + "\n",
+                        encoding="utf-8",
+                    )
+                    (root / "decisions.jsonl").write_text(
+                        "\n".join(json.dumps(item) for item in decisions) + ("\n" if decisions else ""),
+                        encoding="utf-8",
+                    )
+                    args = cli_args(root)
+
+                    with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                        engine, "run_vault_query", return_value=portfolio()
+                    ):
+                        with self.assertRaises(SystemExit) as raised:
+                            engine.main()
+
+                    message = str(raised.exception)
+                    self.assertIn(str(root / ledger_name), message)
+                    self.assertIn(f"line {expected_line}", message)
+
+    def test_nested_policy_type_errors_report_path_and_field(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "evidence.jsonl").write_text("", encoding="utf-8")
+            (root / "decisions.jsonl").write_text("", encoding="utf-8")
+            cases = (
+                ("selection_limits", [1, 2, 3], "selection_limits"),
+                (
+                    "authority_weights",
+                    {**policy()["authority_weights"], "genre_mechanism": "heavy"},
+                    "authority_weights.genre_mechanism",
+                ),
+            )
+            for field, malformed, expected_field in cases:
+                with self.subTest(field=field):
+                    malformed_policy = policy()
+                    malformed_policy[field] = malformed
+                    (root / "policy.json").write_text(
+                        json.dumps(malformed_policy),
+                        encoding="utf-8",
+                    )
+                    args = cli_args(root)
+
+                    with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                        engine, "run_vault_query", return_value=portfolio()
+                    ), mock.patch("builtins.print"):
+                        with self.assertRaises(SystemExit) as raised:
+                            engine.main()
+
+                    message = str(raised.exception)
+                    self.assertIn(str(args.evidence_policy), message)
+                    self.assertIn(expected_field, message)
 
     def test_no_derived_evidence_skips_files_and_emits_empty_disabled_layer(self):
         with tempfile.TemporaryDirectory() as temp_dir:
