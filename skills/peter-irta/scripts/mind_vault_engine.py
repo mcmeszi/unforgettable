@@ -373,6 +373,20 @@ def load_validated_evidence_ledgers(
         content_by_id.setdefault(evidence_id, content_hash)
         record_by_id.setdefault(evidence_id, record)
 
+    for line_number, record in evidence_rows:
+        for parent_id in record["provenance"]["parent_evidence_ids"]:
+            parent = record_by_id.get(parent_id)
+            if parent is None:
+                error = ValueError(f"evidence has missing parent: {parent_id}")
+                raise _ledger_error(evidence_path, line_number, error) from error
+            if parent["evidence_type"] != "evaluation_observation":
+                error = ValueError(f"evidence parent must be an evaluation_observation: {parent_id}")
+                raise _ledger_error(evidence_path, line_number, error) from error
+        for superseded_id in record["supersedes"]:
+            if superseded_id not in record_by_id:
+                error = ValueError(f"supersedes references missing evidence: {superseded_id}")
+                raise _ledger_error(evidence_path, line_number, error) from error
+
     for line_number, decision in decision_rows:
         try:
             _validate_decision(decision)
@@ -382,35 +396,12 @@ def load_validated_evidence_ledgers(
     if not evidence_path.is_file() or not decision_path.is_file():
         return evidence_records, evidence_decisions
 
-    for line_number, record in evidence_rows:
-        if record["status"] == "active" and record["evidence_type"] in {"guard", "mechanism"}:
-            for parent_id in record["provenance"]["parent_evidence_ids"]:
-                parent = record_by_id.get(parent_id)
-                if parent is None:
-                    error = ValueError(f"active derived evidence has missing parent: {parent_id}")
-                    raise _ledger_error(evidence_path, line_number, error) from error
-                if (
-                    parent["evidence_type"] != "evaluation_observation"
-                    or parent["status"] not in {"pending_review", "active"}
-                ):
-                    error = ValueError(
-                        f"active derived evidence parent must be a pending or active evaluation_observation: {parent_id}"
-                    )
-                    raise _ledger_error(evidence_path, line_number, error) from error
-        for superseded_id in record["supersedes"]:
-            superseded = record_by_id.get(superseded_id)
-            if superseded is None:
-                error = ValueError(f"supersedes references missing evidence: {superseded_id}")
-                raise _ledger_error(evidence_path, line_number, error) from error
-            if superseded["status"] != "active":
-                error = ValueError(f"supersedes must reference active evidence: {superseded_id}")
-                raise _ledger_error(evidence_path, line_number, error) from error
-
-    try:
-        project_state(evidence_records, [])
-    except ValueError as error:
-        fallback_line = evidence_rows[-1][0]
-        raise _ledger_error(evidence_path, fallback_line, error) from error
+    if not decision_rows:
+        try:
+            project_state(evidence_records, [])
+        except ValueError as error:
+            fallback_line = evidence_rows[-1][0]
+            raise _ledger_error(evidence_path, fallback_line, error) from error
 
     applied_decisions: list[dict] = []
     for line_number, decision in decision_rows:

@@ -486,6 +486,77 @@ class EngineCliTests(unittest.TestCase):
                 self.assertEqual(packet["selected_evidence"]["mechanisms"], [])
                 self.assertEqual(packet["selected_evidence"]["guards"], [])
 
+    def test_static_evidence_reference_errors_precede_missing_decision_fallback(self):
+        missing_parent = active_derived("mechanism", 10, "Hiányzó szülő.")
+        wrong_type_parent = observation()
+        wrong_type_parent["evidence_id"] = "ev-" + "c" * 24
+        wrong_type_parent["evidence_type"] = "utility_observation"
+        wrong_type_parent["authority"] = "utility_only"
+        wrong_type_child = active_derived("mechanism", 11, "Rossz típusú szülő.")
+        wrong_type_child["provenance"]["parent_evidence_ids"] = [wrong_type_parent["evidence_id"]]
+        missing_superseded = active_derived("mechanism", 12, "Hiányzó előd.")
+        missing_superseded["supersedes"] = ["ev-" + "b" * 24]
+        cases = (
+            ("missing-parent", [missing_parent], 1),
+            ("wrong-type-parent", [wrong_type_parent, wrong_type_child], 2),
+            ("missing-superseded", [observation(), missing_superseded], 2),
+        )
+
+        for name, records, expected_line in cases:
+            with self.subTest(error=name), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+                (root / "evidence.jsonl").write_text(
+                    "\n".join(json.dumps(item) for item in records) + "\n",
+                    encoding="utf-8",
+                )
+                args = cli_args(root)
+
+                with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                    engine, "run_vault_query", return_value=portfolio()
+                ):
+                    with self.assertRaises(SystemExit) as raised:
+                        engine.main()
+
+                message = str(raised.exception)
+                self.assertIn(str(args.evidence_ledger), message)
+                self.assertIn(f"line {expected_line}", message)
+
+    def test_supersedes_active_status_is_checked_after_decisions(self):
+        parent = observation()
+        target = active_derived("mechanism", 13, "Korábbi mechanizmus.")
+        replacement = active_derived("mechanism", 14, "Új mechanizmus.")
+        target["status"] = "pending_review"
+        replacement["status"] = "pending_review"
+        replacement["supersedes"] = [target["evidence_id"]]
+        target_decision = decision(target["evidence_id"], "active")
+        replacement_decision = decision(replacement["evidence_id"], "active")
+        replacement_decision["decided_at"] = "2026-08-19T10:00:00Z"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+            (root / "evidence.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in (parent, target, replacement)) + "\n",
+                encoding="utf-8",
+            )
+            (root / "decisions.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in (target_decision, replacement_decision)) + "\n",
+                encoding="utf-8",
+            )
+            args = cli_args(root)
+
+            with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                engine, "run_vault_query", return_value=portfolio()
+            ), mock.patch("builtins.print"):
+                self.assertEqual(engine.main(), 0)
+
+            packet = json.loads(args.output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["evidence_id"] for item in packet["selected_evidence"]["mechanisms"]],
+                [replacement["evidence_id"]],
+            )
+
     def test_projection_errors_report_the_causal_ledger_row(self):
         base_observation = observation()
         conflicting_duplicate = observation()
