@@ -106,8 +106,11 @@ def validate_human_result(result: dict) -> None:
         feedback = item.get("candidate_feedback")
         if not isinstance(feedback, dict) or set(feedback) != SYSTEMS:
             raise ValueError("candidate_feedback must be keyed by known systems")
-        if any(not isinstance(note, dict) for note in feedback.values()):
-            raise ValueError("candidate_feedback values must be objects")
+        for system, note in feedback.items():
+            if not isinstance(note, dict) or not set(note) <= {"highlight", "note"}:
+                raise ValueError(f"candidate_feedback.{system} may contain only highlight and note")
+            if any(not isinstance(value, str) for value in note.values()):
+                raise ValueError(f"candidate_feedback.{system} highlight and note must be strings")
 
         draft_hashes = item.get("draft_hashes")
         if not isinstance(draft_hashes, dict) or set(draft_hashes) != {"left", "right"}:

@@ -291,6 +291,72 @@ class HumanBlindImportTests(unittest.TestCase):
 
         self.assertEqual(result["items"][0]["candidate_feedback"]["engine_v3"]["note"], "Natural.")
 
+    def test_import_preserves_valid_string_candidate_feedback(self):
+        records = importer.build_observation_records(make_human_result(), make_private_key())
+
+        self.assertEqual(
+            records[0]["content"]["candidate_feedback"],
+            {
+                "engine_v3": {"highlight": "Strong line", "note": "Natural."},
+                "legacy": {"highlight": "", "note": "Stilted."},
+            },
+        )
+
+    def test_import_rejects_candidate_feedback_nested_full_draft_key(self):
+        result = make_human_result()
+        result["items"][0]["candidate_feedback"]["engine_v3"]["full_draft"] = {
+            "text": "SECRET FULL DRAFT",
+        }
+
+        with self.assertRaisesRegex(ValueError, "candidate_feedback"):
+            importer.build_observation_records(result, make_private_key())
+
+    def test_import_rejects_candidate_feedback_side_key(self):
+        result = make_human_result()
+        result["items"][0]["candidate_feedback"]["legacy"]["left"] = "SECRET FULL DRAFT"
+
+        with self.assertRaisesRegex(ValueError, "candidate_feedback"):
+            importer.build_observation_records(result, make_private_key())
+
+    def test_import_rejects_candidate_feedback_candidate_label_key(self):
+        result = make_human_result()
+        result["items"][0]["candidate_feedback"]["engine_v3"]["candidate_label"] = "A"
+
+        with self.assertRaisesRegex(ValueError, "candidate_feedback"):
+            importer.build_observation_records(result, make_private_key())
+
+    def test_import_rejects_non_string_candidate_feedback_values(self):
+        for field, value in (("highlight", {"text": "SECRET FULL DRAFT"}), ("note", ["not text"])):
+            with self.subTest(field=field):
+                result = make_human_result()
+                result["items"][0]["candidate_feedback"]["engine_v3"][field] = value
+                with self.assertRaisesRegex(ValueError, "candidate_feedback"):
+                    importer.build_observation_records(result, make_private_key())
+
+    def test_import_cli_does_not_append_rejected_candidate_feedback(self):
+        result = make_human_result()
+        result["items"][0]["candidate_feedback"]["engine_v3"]["full_draft"] = {
+            "text": "SECRET FULL DRAFT",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result_path = root / "result.json"
+            private_key_path = root / "private-key.json"
+            ledger = root / "evidence.jsonl"
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            private_key_path.write_text(json.dumps(make_private_key()), encoding="utf-8")
+
+            completed = subprocess.run(
+                [sys.executable, str(IMPORTER_PATH), "--result", str(result_path),
+                 "--private-key", str(private_key_path), "--ledger", str(ledger)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(ledger.exists())
+
     def test_import_accepts_actual_finalized_shape_without_boolean_marker(self):
         importer.validate_human_result(make_human_result())
 
