@@ -1,15 +1,27 @@
 import importlib.util
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "evidence_vault.py"
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+MODULE_PATH = SCRIPTS / "evidence_vault.py"
 SPEC = importlib.util.spec_from_file_location("evidence_vault", MODULE_PATH)
 evidence_vault = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(evidence_vault)
+
+IMPORTER_PATH = SCRIPTS / "import_human_blind_feedback.py"
+IMPORTER_SPEC = importlib.util.spec_from_file_location("import_human_blind_feedback", IMPORTER_PATH)
+importer = importlib.util.module_from_spec(IMPORTER_SPEC)
+assert IMPORTER_SPEC.loader is not None
+IMPORTER_SPEC.loader.exec_module(importer)
 
 
 POLICY_PATH = Path(__file__).resolve().parents[1] / "references" / "evidence-policy.json"
@@ -52,6 +64,61 @@ def make_decision(evidence_id, status, **overrides):
     }
     base.update(overrides)
     return base
+
+
+def make_human_result(item_count=2, **overrides):
+    items = []
+    for number in range(1, item_count + 1):
+        items.append({
+            "item_id": f"item-{number:02d}",
+            "brief_id": f"slam-{number:02d}",
+            "genre": "slam",
+            "choice": "left",
+            "chosen_system": "engine_v3",
+            "reason": f"Reason {number} is explicit.",
+            "flags": ["brief_mismatch"],
+            "candidate_feedback": {
+                "engine_v3": {"highlight": "Strong line", "note": "Natural."},
+                "legacy": {"highlight": "", "note": "Stilted."},
+            },
+            "general_note": "Compare the two approaches.",
+            "answered_at": "2026-08-19T10:00:00+00:00",
+            "draft_hashes": {"left": "a" * 64, "right": "b" * 64},
+            "left_text": "SECRET FULL DRAFT",
+        })
+    base = {
+        "schema_version": 1,
+        "run_id": "hbt-" + "a" * 24,
+        "seed": 20260818,
+        "public_sha256": "c" * 64,
+        "private_sha256": "d" * 64,
+        "finalized_at": "2026-08-19T11:00:00+00:00",
+        "item_count": item_count,
+        "overall": {"legacy": 0, "engine_v3": item_count, "tie": 0},
+        "by_genre": {"slam": {"legacy": 0, "engine_v3": item_count, "tie": 0}},
+        "items": items,
+        "utility_written": False,
+        "learned_preference_claimed": False,
+        "feedback_review_required": True,
+    }
+    base.update(overrides)
+    return base
+
+
+def make_private_key(item_count=2):
+    return {
+        "schema_version": 1,
+        "items": {
+            f"item-{number:02d}": {
+                "brief_id": f"slam-{number:02d}",
+                "left": "engine_v3",
+                "right": "legacy",
+                "left_candidate": "A",
+                "right_candidate": "B",
+            }
+            for number in range(1, item_count + 1)
+        },
+    }
 
 
 class EvidenceIdentityTests(unittest.TestCase):
@@ -190,6 +257,133 @@ class LedgerAndPolicyTests(unittest.TestCase):
         self.assertEqual(policy["schema"], "mind-vault-evidence-policy/v1")
         self.assertEqual(policy["policy_version"], "2026-08-19.1")
         self.assertIn("spoken_delivery", policy["allowed_scopes"])
+
+
+class HumanBlindImportTests(unittest.TestCase):
+    def test_import_builds_pending_observation_without_side_mapping(self):
+        records = importer.build_observation_records(make_human_result(), make_private_key())
+
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(item["status"] == "pending_review" for item in records))
+        rendered = json.dumps(records, ensure_ascii=False)
+        self.assertNotIn('"left"', rendered)
+        self.assertNotIn('"right"', rendered)
+        self.assertNotIn("SECRET FULL DRAFT", rendered)
+        self.assertEqual(
+            set(records[0]["content"]["draft_sha256_by_system"]), {"engine_v3", "legacy"}
+        )
+        self.assertEqual(records[0]["evidence_type"], "evaluation_observation")
+        evidence_vault.validate_record(records[0])
+
+    def test_import_is_idempotent(self):
+        records = importer.build_observation_records(make_human_result(), make_private_key())
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "evidence.jsonl"
+            self.assertEqual(importer.append_new_records(records, ledger), 2)
+            self.assertEqual(importer.append_new_records(records, ledger), 0)
+            self.assertEqual(len(evidence_vault.read_jsonl(ledger)), 2)
+
+    def test_import_records_do_not_mutate_the_immutable_result(self):
+        result = make_human_result()
+        records = importer.build_observation_records(result, make_private_key())
+
+        records[0]["content"]["candidate_feedback"]["engine_v3"]["note"] = "Changed later"
+
+        self.assertEqual(result["items"][0]["candidate_feedback"]["engine_v3"]["note"], "Natural.")
+
+    def test_import_accepts_actual_finalized_shape_without_boolean_marker(self):
+        importer.validate_human_result(make_human_result())
+
+    def test_import_rejects_explicit_false_finalized_marker(self):
+        with self.assertRaisesRegex(ValueError, "finalized"):
+            importer.validate_human_result(make_human_result(finalized=False))
+
+    def test_import_rejects_missing_or_invalid_finalized_timestamp(self):
+        missing = make_human_result()
+        missing.pop("finalized_at")
+        with self.assertRaisesRegex(ValueError, "finalized_at"):
+            importer.validate_human_result(missing)
+        with self.assertRaisesRegex(ValueError, "finalized_at"):
+            importer.validate_human_result(make_human_result(finalized_at="not-a-timestamp"))
+
+    def test_import_rejects_item_count_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "item_count"):
+            importer.validate_human_result(make_human_result(item_count=2, items=[]))
+
+    def test_import_rejects_duplicate_brief_ids(self):
+        result = make_human_result()
+        result["items"][1]["brief_id"] = result["items"][0]["brief_id"]
+        with self.assertRaisesRegex(ValueError, "brief_id"):
+            importer.validate_human_result(result)
+
+    def test_import_rejects_invalid_draft_hash(self):
+        result = make_human_result()
+        result["items"][0]["draft_hashes"]["left"] = "not-a-hash"
+        with self.assertRaisesRegex(ValueError, "draft_hashes"):
+            importer.validate_human_result(result)
+
+    def test_import_rejects_unknown_system(self):
+        result = make_human_result()
+        result["items"][0]["chosen_system"] = "unknown"
+        with self.assertRaisesRegex(ValueError, "chosen_system"):
+            importer.validate_human_result(result)
+
+    def test_import_rejects_safety_flags_that_allow_learning(self):
+        for field, value in (
+            ("utility_written", True),
+            ("learned_preference_claimed", True),
+            ("feedback_review_required", False),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    importer.validate_human_result(make_human_result(**{field: value}))
+
+    def test_import_rejects_private_key_brief_or_system_mapping_mismatch(self):
+        bad_brief = make_private_key()
+        bad_brief["items"]["item-01"]["brief_id"] = "other-brief"
+        with self.assertRaisesRegex(ValueError, "brief_id"):
+            importer.build_observation_records(make_human_result(), bad_brief)
+
+        bad_system = make_private_key()
+        bad_system["items"]["item-01"]["right"] = "unknown"
+        with self.assertRaisesRegex(ValueError, "system mapping"):
+            importer.build_observation_records(make_human_result(), bad_system)
+
+    def test_import_cli_reports_atomic_append_counts_and_ledger_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result_path = root / "result.json"
+            private_key_path = root / "private-key.json"
+            ledger = root / "evidence.jsonl"
+            result_path.write_text(json.dumps(make_human_result()), encoding="utf-8")
+            private_key_path.write_text(json.dumps(make_private_key()), encoding="utf-8")
+
+            first = subprocess.run(
+                [sys.executable, str(IMPORTER_PATH), "--result", str(result_path),
+                 "--private-key", str(private_key_path), "--ledger", str(ledger)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertTrue(first.stdout, first.stderr)
+            self.assertEqual(json.loads(first.stdout)["added_records"], 2)
+
+            second = subprocess.run(
+                [sys.executable, str(IMPORTER_PATH), "--result", str(result_path),
+                 "--private-key", str(private_key_path), "--ledger", str(ledger)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertTrue(second.stdout, second.stderr)
+            report = json.loads(second.stdout)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(report["source_run_id"], "hbt-" + "a" * 24)
+            self.assertEqual(report["input_items"], 2)
+            self.assertEqual(report["added_records"], 0)
+            self.assertEqual(report["existing_records"], 2)
+            self.assertRegex(report["ledger_sha256"], r"^[0-9a-f]{64}$")
 
 
 if __name__ == "__main__":
