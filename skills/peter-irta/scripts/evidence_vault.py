@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -255,3 +256,214 @@ def load_policy(path: Path) -> dict:
     _require_string(policy["state"], "state")
     _require_string_list(policy["allowed_scopes"], "allowed_scopes")
     return policy
+
+
+def _normalized_text(value: object) -> str:
+    """Normalize human-facing values for deterministic selector matching."""
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(character for character in text if not unicodedata.combining(character))
+    return text.casefold().replace("_", " ")
+
+
+def _tokens(value: object) -> list[str]:
+    return re.findall(r"[a-z0-9]+", _normalized_text(value))
+
+
+def _plan_value(plan: dict, key: str) -> str:
+    value = plan.get(key, "")
+    return str(value.get("value", "")) if isinstance(value, dict) else str(value or "")
+
+
+def _target_genre(plan: dict) -> str:
+    return _normalized_text(_plan_value(plan, "genre")).strip()
+
+
+def _record_genres(record: dict) -> set[str]:
+    return {_normalized_text(item).strip() for item in record.get("genre") or [] if str(item).strip()}
+
+
+def _genre_match(record: dict, plan: dict) -> str:
+    target = _target_genre(plan)
+    genres = _record_genres(record)
+    if target and target in genres:
+        return "exact"
+    if "global" in genres:
+        return "global"
+    return ""
+
+
+def adapt_voice_sources(portfolio: dict) -> list[dict]:
+    """Adapt only the existing execution set into bounded voice evidence."""
+    source_by_id = {str(item.get("id")): item for item in portfolio.get("sources") or []}
+    execution = (portfolio.get("contrastive_calibration") or {}).get("execution_set") or []
+    return [
+        {
+            "evidence_id": f"voice-{item['id']}",
+            "evidence_type": "voice_source",
+            "authority": "voice",
+            "source": source_by_id.get(str(item["id"]), {}),
+            "original_rank": rank,
+        }
+        for rank, item in enumerate(execution, start=1)
+        if item.get("id")
+    ]
+
+
+def score_derived(record: dict, plan: dict, policy: dict) -> tuple[float, list[str]]:
+    """Score one active derived record from policy weights and brief relevance."""
+    if record.get("status") != "active" or record.get("evidence_type") not in {"guard", "mechanism"}:
+        return 0.0, ["inactive or unsupported evidence"]
+
+    genre_match = _genre_match(record, plan)
+    if not genre_match:
+        return 0.0, ["genre mismatch"]
+
+    scope_tokens = _tokens(" ".join(str(item) for item in record.get("scope") or []))
+    brief_text = " ".join(
+        [
+            str(plan.get("brief") or ""),
+            _plan_value(plan, "purpose"),
+            _plan_value(plan, "audience"),
+            _plan_value(plan, "query"),
+            " ".join(str(item) for item in plan.get("negative_preferences") or []),
+            _target_genre(plan),
+        ]
+    )
+    brief_tokens = set(_tokens(brief_text))
+    brief_fit = sum(token in brief_tokens for token in scope_tokens) / len(scope_tokens) if scope_tokens else 0.0
+    authority_weight = float((policy.get("authority_weights") or {}).get(record.get("authority"), 0.0))
+    confidence_level = (record.get("confidence") or {}).get("level")
+    confidence_weight = float((policy.get("confidence_weights") or {}).get(confidence_level, 0.0))
+    genre_bonus = float(policy.get("genre_exact_bonus", 0.0) if genre_match == "exact" else policy.get("genre_global_bonus", 0.0))
+    scope_bonus = float(policy.get("scope_brief_match_bonus", 0.0)) if brief_fit else 0.0
+    score = brief_fit + genre_bonus + authority_weight + confidence_weight + scope_bonus
+    reasons = [
+        f"brief_fit:{brief_fit:.4f}",
+        f"genre:{genre_match}",
+        f"authority:{authority_weight:.4f}",
+        f"confidence:{confidence_weight:.4f}",
+    ]
+    if scope_bonus:
+        reasons.append(f"scope_match:{scope_bonus:.4f}")
+    return score, reasons
+
+
+def _normalized_scope(scope: object) -> str:
+    return "_".join(_tokens(scope))
+
+
+def _guard_level(record: dict) -> str:
+    content = record.get("content") or {}
+    return str(content.get("guard_level") or content.get("level") or "soft")
+
+
+def _polarity(record: dict) -> str:
+    value = str((record.get("content") or {}).get("polarity") or "prefer")
+    return value if value in {"require", "forbid", "prefer"} else "prefer"
+
+
+def _selected_derived(record: dict, score: float, reasons: list[str]) -> dict:
+    content = record.get("content") or {}
+    return {
+        "evidence_id": record.get("evidence_id"),
+        "evidence_type": record.get("evidence_type"),
+        "genre": list(record.get("genre") or []),
+        "scope": list(record.get("scope") or []),
+        "directive": str(content.get("directive") or ""),
+        "level": _guard_level(record),
+        "confidence": str((record.get("confidence") or {}).get("level") or ""),
+        "score": round(score, 8),
+        "reasons": list(reasons),
+    }
+
+
+def _ranked(records: list[dict], plan: dict, policy: dict) -> list[tuple[dict, float, list[str]]]:
+    scored = []
+    for record in records:
+        score, reasons = score_derived(record, plan, policy)
+        if _genre_match(record, plan):
+            scored.append((record, score, reasons))
+    return sorted(scored, key=lambda item: (-item[1], str(item[0].get("evidence_id") or "")))
+
+
+def _guard_conflicts(guards: list[dict], plan: dict) -> tuple[set[str], list[dict]]:
+    """Find unresolved require/forbid pairs for the current output genre."""
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    target = _target_genre(plan)
+    for record in guards:
+        for scope in record.get("scope") or []:
+            normalized_scope = _normalized_scope(scope)
+            if normalized_scope:
+                grouped.setdefault((target, normalized_scope), []).append(record)
+
+    excluded: set[str] = set()
+    conflicts = []
+    for (genre_scope, scope), records in sorted(grouped.items()):
+        require = [record for record in records if _polarity(record) == "require"]
+        forbid = [record for record in records if _polarity(record) == "forbid"]
+        if not require or not forbid:
+            continue
+        conflicting = set()
+        for left in require:
+            for right in forbid:
+                left_id = str(left.get("evidence_id"))
+                right_id = str(right.get("evidence_id"))
+                if right_id in set(left.get("supersedes") or []) or left_id in set(right.get("supersedes") or []):
+                    continue
+                conflicting.update((left_id, right_id))
+        if conflicting:
+            evidence_ids = sorted(conflicting)
+            excluded.update(evidence_ids)
+            conflicts.append({"genre_scope": genre_scope, "scope": scope, "evidence_ids": evidence_ids})
+    return excluded, conflicts
+
+
+def select_evidence(portfolio: dict, plan: dict, projected: dict[str, dict], policy: dict) -> dict:
+    """Purely select active curated evidence with a stable, privacy-safe result."""
+    active = [
+        record
+        for record in projected.values()
+        if record.get("status") == "active" and record.get("evidence_type") in {"guard", "mechanism"}
+    ]
+    eligible = [record for record in active if _genre_match(record, plan)]
+    superseded_ids = {
+        superseded_id
+        for record in eligible
+        for superseded_id in record.get("supersedes") or []
+    }
+    eligible = [record for record in eligible if record.get("evidence_id") not in superseded_ids]
+    guards = [record for record in eligible if record.get("evidence_type") == "guard"]
+    mechanisms = [record for record in eligible if record.get("evidence_type") == "mechanism"]
+    conflicting_ids, conflicts = _guard_conflicts(guards, plan)
+    guards = [record for record in guards if record.get("evidence_id") not in conflicting_ids]
+
+    ranked_guards = _ranked(guards, plan, policy)
+    hard_guards = [item for item in ranked_guards if _guard_level(item[0]) == "hard"]
+    soft_guards = [item for item in ranked_guards if _guard_level(item[0]) != "hard"]
+    limits = policy.get("selection_limits") or {}
+    selected_guards = hard_guards + soft_guards[:int(limits.get("soft_guards", 3))]
+    selected_mechanisms = _ranked(mechanisms, plan, policy)[:int(limits.get("mechanisms", 3))]
+    voice = adapt_voice_sources(portfolio)[:int(limits.get("voice", 5))]
+
+    selected_derived = [
+        ("guard", _selected_derived(record, score, reasons)) for record, score, reasons in selected_guards
+    ] + [
+        ("mechanism", _selected_derived(record, score, reasons)) for record, score, reasons in selected_mechanisms
+    ]
+    selection_trace = [
+        {"channel": channel, "evidence_id": item["evidence_id"], "score": item["score"], "reasons": item["reasons"]}
+        for channel, item in selected_derived
+    ]
+    selection_trace.extend(
+        {"channel": "voice", "evidence_id": item["evidence_id"], "original_rank": item["original_rank"]}
+        for item in voice
+    )
+    return {
+        "voice": voice,
+        "mechanisms": [item for channel, item in selected_derived if channel == "mechanism"],
+        "guards": [item for channel, item in selected_derived if channel == "guard"],
+        "conflicts": conflicts,
+        "selection_trace": selection_trace,
+        "ledger_sha256": canonical_sha256(projected),
+        "policy_version": policy.get("policy_version"),
+    }

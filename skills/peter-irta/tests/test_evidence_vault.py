@@ -626,6 +626,163 @@ class CurationTests(unittest.TestCase):
             self.assertEqual(len(evidence_vault.read_jsonl(decision_path)), 1)
 
 
+def selector_portfolio(execution_ids=("one", "two")):
+    return {
+        "sources": [
+            {"id": source_id, "title": f"Source {source_id}", "raw_observation": "private source text"}
+            for source_id in execution_ids
+        ],
+        "contrastive_calibration": {
+            "execution_set": [{"id": source_id} for source_id in execution_ids],
+        },
+    }
+
+
+def selector_plan(genre="slam", *, text="spoken delivery"):
+    return {
+        "brief": text,
+        "genre": {"value": genre},
+        "purpose": {"value": "clear delivery"},
+        "audience": {"value": "live audience"},
+        "query": {"value": text},
+        "negative_preferences": ["avoid generic phrasing"],
+    }
+
+
+def active_derived(kind, number, *, genres=("slam",), scopes=("spoken_delivery",),
+                   level="soft", polarity="prefer", supersedes=()):
+    return make_record(
+        evidence_id=f"ev-{number:024x}",
+        evidence_type=kind,
+        status="active",
+        authority="generation_guard" if kind == "guard" else "genre_mechanism",
+        genre=list(genres),
+        scope=list(scopes),
+        content={
+            "directive": f"Directive {number}",
+            "level": level,
+            "polarity": polarity,
+            "observation": "PRIVATE HUMAN OBSERVATION",
+        },
+        supersedes=list(supersedes),
+    )
+
+
+class SelectorTests(unittest.TestCase):
+    def setUp(self):
+        self.policy = evidence_vault.load_policy(POLICY_PATH)
+
+    def select(self, items, *, plan=None, portfolio=None):
+        projected = {item["evidence_id"]: item for item in items}
+        return evidence_vault.select_evidence(
+            portfolio or selector_portfolio(), plan or selector_plan(), projected, self.policy
+        )
+
+    def test_genre_specific_mechanism_beats_equivalent_global_record(self):
+        global_item = active_derived("mechanism", 2, genres=("global",))
+        slam_item = active_derived("mechanism", 1, genres=("slam",))
+
+        selected = self.select([global_item, slam_item])
+
+        self.assertEqual(selected["mechanisms"][0]["evidence_id"], slam_item["evidence_id"])
+
+    def test_conflicting_guards_are_reported_and_both_excluded(self):
+        require = active_derived("guard", 1, genres=("cikk",), scopes=("output_surface_markdown",), polarity="require")
+        forbid = active_derived("guard", 2, genres=("cikk",), scopes=("output_surface_markdown",), polarity="forbid")
+
+        selected = self.select([require, forbid], plan=selector_plan("cikk", text="markdown output"))
+
+        self.assertEqual(selected["guards"], [])
+        self.assertEqual(
+            selected["conflicts"][0]["evidence_ids"],
+            sorted([require["evidence_id"], forbid["evidence_id"]]),
+        )
+
+    def test_direct_supersession_avoids_a_guard_conflict(self):
+        require = active_derived("guard", 1, genres=("cikk",), scopes=("output_surface_markdown",), polarity="require")
+        forbid = active_derived(
+            "guard", 2, genres=("cikk",), scopes=("output_surface_markdown",), polarity="forbid", supersedes=(require["evidence_id"],)
+        )
+
+        selected = self.select([require, forbid], plan=selector_plan("cikk", text="markdown output"))
+
+        self.assertEqual(selected["conflicts"], [])
+        self.assertEqual([item["evidence_id"] for item in selected["guards"]], [forbid["evidence_id"]])
+
+    def test_hard_guards_survive_the_soft_limit(self):
+        hard = active_derived("guard", 10, level="hard")
+        soft = [active_derived("guard", number) for number in range(1, 5)]
+
+        selected = self.select([hard, *soft])
+
+        self.assertIn(hard["evidence_id"], [item["evidence_id"] for item in selected["guards"]])
+        self.assertEqual(len(selected["guards"]), 4)
+
+    def test_inactive_observations_are_never_selected(self):
+        observation = make_record(
+            evidence_id="ev-" + "f" * 24,
+            evidence_type="evaluation_observation",
+            status="active",
+            authority="evaluation_only",
+            content={"observation": "PRIVATE HUMAN OBSERVATION"},
+        )
+
+        selected = self.select([observation])
+
+        self.assertEqual(selected["mechanisms"], [])
+        self.assertEqual(selected["guards"], [])
+        self.assertNotIn("PRIVATE HUMAN OBSERVATION", json.dumps(selected, ensure_ascii=False))
+
+    def test_equal_scores_use_evidence_id_tie_breaking(self):
+        later = active_derived("mechanism", 2)
+        earlier = active_derived("mechanism", 1)
+
+        selected = self.select([later, earlier])
+
+        self.assertEqual(
+            [item["evidence_id"] for item in selected["mechanisms"]],
+            [earlier["evidence_id"], later["evidence_id"]],
+        )
+
+    def test_irrelevant_genre_is_excluded(self):
+        article_only = active_derived("mechanism", 1, genres=("cikk",))
+
+        selected = self.select([article_only], plan=selector_plan("slam"))
+
+        self.assertEqual(selected["mechanisms"], [])
+
+    def test_empty_ledger_has_a_deterministic_voice_only_fallback(self):
+        selected = self.select([], portfolio=selector_portfolio(("one", "two")))
+
+        self.assertEqual(set(selected), {
+            "voice", "mechanisms", "guards", "conflicts", "selection_trace", "ledger_sha256", "policy_version",
+        })
+        self.assertEqual([item["evidence_id"] for item in selected["voice"]], ["voice-one", "voice-two"])
+        self.assertEqual(selected["mechanisms"], [])
+        self.assertEqual(selected["guards"], [])
+        self.assertEqual(selected["conflicts"], [])
+        self.assertEqual(selected["ledger_sha256"], evidence_vault.canonical_sha256({}))
+
+    def test_voice_limit_preserves_execution_order(self):
+        source_ids = tuple(f"source-{number}" for number in range(1, 8))
+
+        selected = self.select([], portfolio=selector_portfolio(source_ids))
+
+        self.assertEqual(
+            [item["evidence_id"] for item in selected["voice"]],
+            [f"voice-{source_id}" for source_id in source_ids[:5]],
+        )
+
+    def test_selected_derived_entries_are_sanitized(self):
+        selected = self.select([active_derived("mechanism", 1)])
+
+        self.assertEqual(
+            set(selected["mechanisms"][0]),
+            {"evidence_id", "evidence_type", "genre", "scope", "directive", "level", "confidence", "score", "reasons"},
+        )
+        self.assertNotIn("PRIVATE HUMAN OBSERVATION", json.dumps(selected, ensure_ascii=False))
+
+
 class HumanBlindImportTests(unittest.TestCase):
     def test_import_builds_pending_observation_without_side_mapping(self):
         records = importer.build_observation_records(make_human_result(), make_private_key())
