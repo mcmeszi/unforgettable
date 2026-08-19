@@ -1,0 +1,30 @@
+{
+  "schema": "mind-vault-evidence-policy/v1",
+  "policy_version": "2026-08-19.1",
+  "state": "manual_policy_cold_start",
+  "authority_weights": {
+    "voice": 1.0,
+    "genre_mechanism": 0.7,
+    "generation_guard": 0.7,
+    "evaluation_only": 0.0,
+    "utility_only": 0.0
+  },
+  "confidence_weights": {"low": 0.1, "medium": 0.2, "high": 0.3},
+  "selection_limits": {"voice": 5, "mechanisms": 3, "soft_guards": 3},
+  "genre_exact_bonus": 0.5,
+  "genre_global_bonus": 0.1,
+  "scope_brief_match_bonus": 0.4,
+  "allowed_scopes": [
+    "canned_fair_counterargument",
+    "output_surface_markdown",
+    "spoken_delivery",
+    "speaker_coherence",
+    "first_obvious_ad_concept",
+    "campaign_coherence",
+    "song_singability",
+    "song_rhyme_architecture",
+    "poetry_lineation",
+    "image_coherence",
+    "study_readability_methodology"
+  ]
+}
