@@ -557,6 +557,114 @@ class EngineCliTests(unittest.TestCase):
                 [replacement["evidence_id"]],
             )
 
+    def test_unrelated_decision_prefix_can_precede_later_target_activation(self):
+        parent = observation()
+        unrelated = observation()
+        unrelated["evidence_id"] = "ev-" + "d" * 24
+        target = active_derived("mechanism", 15, "Korábbi mechanizmus.")
+        replacement = active_derived("mechanism", 16, "Későbbi mechanizmus.")
+        target["status"] = "pending_review"
+        replacement["status"] = "pending_review"
+        replacement["supersedes"] = [target["evidence_id"]]
+        unrelated_decision = decision(unrelated["evidence_id"], "active")
+        target_decision = decision(target["evidence_id"], "active")
+        target_decision["decided_at"] = "2026-08-19T10:00:00Z"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+            (root / "evidence.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in (parent, unrelated, target, replacement)) + "\n",
+                encoding="utf-8",
+            )
+            (root / "decisions.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in (unrelated_decision, target_decision)) + "\n",
+                encoding="utf-8",
+            )
+            args = cli_args(root)
+
+            with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                engine, "run_vault_query", return_value=portfolio()
+            ), mock.patch("builtins.print"):
+                self.assertEqual(engine.main(), 0)
+
+            packet = json.loads(args.output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["evidence_id"] for item in packet["selected_evidence"]["mechanisms"]],
+                [target["evidence_id"]],
+            )
+
+    def test_final_projection_error_reports_relationship_evidence_line(self):
+        parent = observation()
+        unrelated = observation()
+        unrelated["evidence_id"] = "ev-" + "c" * 24
+        target = active_derived("mechanism", 17, "Még nem aktív mechanizmus.")
+        replacement = active_derived("mechanism", 18, "Érvénytelen csere.")
+        target["status"] = "pending_review"
+        replacement["status"] = "pending_review"
+        replacement["supersedes"] = [target["evidence_id"]]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+            (root / "evidence.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in (parent, unrelated, target, replacement)) + "\n",
+                encoding="utf-8",
+            )
+            (root / "decisions.jsonl").write_text(
+                json.dumps(decision(unrelated["evidence_id"], "active")) + "\n",
+                encoding="utf-8",
+            )
+            args = cli_args(root)
+
+            with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                engine, "run_vault_query", return_value=portfolio()
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    engine.main()
+
+            message = str(raised.exception)
+            self.assertIn(str(args.evidence_ledger), message)
+            self.assertIn("line 4", message)
+
+    def test_final_projection_error_reports_status_decision_line(self):
+        parent = observation()
+        unrelated = observation()
+        unrelated["evidence_id"] = "ev-" + "b" * 24
+        target = active_derived("mechanism", 19, "Aktív mechanizmus.")
+        replacement = active_derived("mechanism", 20, "Függő csere.")
+        replacement["status"] = "pending_review"
+        replacement["supersedes"] = [target["evidence_id"]]
+        target_retirement = decision(target["evidence_id"], "retired")
+        target_retirement["decided_at"] = "2026-08-19T10:00:00Z"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+            (root / "evidence.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in (parent, unrelated, target, replacement)) + "\n",
+                encoding="utf-8",
+            )
+            (root / "decisions.jsonl").write_text(
+                "\n".join(
+                    json.dumps(item)
+                    for item in (decision(unrelated["evidence_id"], "active"), target_retirement)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            args = cli_args(root)
+
+            with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                engine, "run_vault_query", return_value=portfolio()
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    engine.main()
+
+            message = str(raised.exception)
+            self.assertIn(str(args.decision_ledger), message)
+            self.assertIn("line 2", message)
+
     def test_projection_errors_report_the_causal_ledger_row(self):
         base_observation = observation()
         conflicting_duplicate = observation()
@@ -586,6 +694,26 @@ class EngineCliTests(unittest.TestCase):
                 [decision(base_observation["evidence_id"], "retired")],
                 "decisions.jsonl",
                 1,
+            ),
+            (
+                "non-monotonic-timestamp",
+                [base_observation],
+                [
+                    decision(base_observation["evidence_id"], "active"),
+                    decision(base_observation["evidence_id"], "active"),
+                ],
+                "decisions.jsonl",
+                2,
+            ),
+            (
+                "missing-decision-reference",
+                [base_observation],
+                [
+                    decision(base_observation["evidence_id"], "active"),
+                    decision("ev-" + "a" * 24, "active"),
+                ],
+                "decisions.jsonl",
+                2,
             ),
         )
 

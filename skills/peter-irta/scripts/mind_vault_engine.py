@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from evidence_vault import (
+    ALLOWED_TRANSITIONS,
     _validate_decision,
     canonical_sha256,
     load_policy,
@@ -350,11 +351,62 @@ def _ledger_error(path: Path, line_number: int, error: ValueError) -> ValueError
     return ValueError(f"Invalid evidence ledger at {path} line {line_number}: {error}")
 
 
+def _final_projection_error_location(
+    evidence_rows: list[tuple[int, dict]],
+    decision_rows: list[tuple[int, dict]],
+    effective_status: dict[str, str],
+    evidence_path: Path,
+    decision_path: Path,
+) -> tuple[Path, int]:
+    """Locate the row that best explains an authoritative graph failure."""
+    record_by_id: dict[str, dict] = {}
+    evidence_line_by_id: dict[str, int] = {}
+    for line_number, record in evidence_rows:
+        evidence_id = record["evidence_id"]
+        record_by_id.setdefault(evidence_id, record)
+        evidence_line_by_id.setdefault(evidence_id, line_number)
+
+    last_decision_line: dict[str, int] = {}
+    for line_number, decision in decision_rows:
+        last_decision_line[decision["evidence_id"]] = line_number
+
+    for evidence_id, record in record_by_id.items():
+        evidence_line = evidence_line_by_id[evidence_id]
+        if effective_status[evidence_id] == "active" and record["evidence_type"] in {"guard", "mechanism"}:
+            for parent_id in record["provenance"]["parent_evidence_ids"]:
+                parent = record_by_id.get(parent_id)
+                if (
+                    parent is None
+                    or parent["evidence_type"] != "evaluation_observation"
+                    or effective_status[parent_id] not in {"pending_review", "active"}
+                ):
+                    causal_decisions = [
+                        last_decision_line[item_id]
+                        for item_id in (evidence_id, parent_id)
+                        if item_id in last_decision_line
+                    ]
+                    if causal_decisions:
+                        return decision_path, max(causal_decisions)
+                    return evidence_path, evidence_line
+
+        for superseded_id in record["supersedes"]:
+            if effective_status.get(superseded_id) != "active":
+                if superseded_id in last_decision_line:
+                    return decision_path, last_decision_line[superseded_id]
+                return evidence_path, evidence_line
+
+    if decision_rows:
+        return decision_path, decision_rows[-1][0]
+    if evidence_rows:
+        return evidence_path, evidence_rows[-1][0]
+    return evidence_path, 1
+
+
 def load_validated_evidence_ledgers(
     evidence_path: Path,
     decision_path: Path,
 ) -> tuple[list[dict], list[dict]]:
-    """Read ledgers and project each causal row with path-and-line diagnostics."""
+    """Read ledgers and validate causal rows with path-and-line diagnostics."""
     evidence_records, evidence_rows = _jsonl_rows(evidence_path)
     evidence_decisions, decision_rows = _jsonl_rows(decision_path)
 
@@ -387,29 +439,56 @@ def load_validated_evidence_ledgers(
                 error = ValueError(f"supersedes references missing evidence: {superseded_id}")
                 raise _ledger_error(evidence_path, line_number, error) from error
 
+    validated_decision_rows = []
     for line_number, decision in decision_rows:
         try:
-            _validate_decision(decision)
+            decided_at = _validate_decision(decision)
         except ValueError as error:
             raise _ledger_error(decision_path, line_number, error) from error
+        validated_decision_rows.append((line_number, decision, decided_at))
 
     if not evidence_path.is_file() or not decision_path.is_file():
         return evidence_records, evidence_decisions
 
-    if not decision_rows:
+    effective_status = {
+        evidence_id: record["status"]
+        for evidence_id, record in record_by_id.items()
+    }
+    previous_decision_at = {}
+    for line_number, decision, decided_at in validated_decision_rows:
+        evidence_id = decision["evidence_id"]
+        if evidence_id not in effective_status:
+            error = ValueError(f"decision references missing evidence: {evidence_id}")
+            raise _ledger_error(decision_path, line_number, error) from error
+        previous = previous_decision_at.get(evidence_id)
+        if previous is not None and decided_at <= previous:
+            error = ValueError(f"non-monotonic decision timestamp for evidence: {evidence_id}")
+            raise _ledger_error(decision_path, line_number, error) from error
+        current_status = effective_status[evidence_id]
+        next_status = decision["status"]
+        if next_status not in ALLOWED_TRANSITIONS[current_status]:
+            error = ValueError(f"invalid transition for {evidence_id}: {current_status} -> {next_status}")
+            raise _ledger_error(decision_path, line_number, error) from error
+        projected_record = dict(record_by_id[evidence_id])
+        projected_record["status"] = next_status
         try:
-            project_state(evidence_records, [])
-        except ValueError as error:
-            fallback_line = evidence_rows[-1][0]
-            raise _ledger_error(evidence_path, fallback_line, error) from error
-
-    applied_decisions: list[dict] = []
-    for line_number, decision in decision_rows:
-        try:
-            project_state(evidence_records, [*applied_decisions, decision])
+            validate_record(projected_record)
         except ValueError as error:
             raise _ledger_error(decision_path, line_number, error) from error
-        applied_decisions.append(decision)
+        effective_status[evidence_id] = next_status
+        previous_decision_at[evidence_id] = decided_at
+
+    try:
+        project_state(evidence_records, evidence_decisions)
+    except ValueError as error:
+        causal_path, causal_line = _final_projection_error_location(
+            evidence_rows,
+            decision_rows,
+            effective_status,
+            evidence_path,
+            decision_path,
+        )
+        raise _ledger_error(causal_path, causal_line, error) from error
     return evidence_records, evidence_decisions
 
 
