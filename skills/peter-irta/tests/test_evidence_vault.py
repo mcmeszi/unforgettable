@@ -23,6 +23,12 @@ importer = importlib.util.module_from_spec(IMPORTER_SPEC)
 assert IMPORTER_SPEC.loader is not None
 IMPORTER_SPEC.loader.exec_module(importer)
 
+CURATOR_PATH = SCRIPTS / "curate_evidence.py"
+CURATOR_SPEC = importlib.util.spec_from_file_location("curate_evidence", CURATOR_PATH)
+curator = importlib.util.module_from_spec(CURATOR_SPEC)
+assert CURATOR_SPEC.loader is not None
+CURATOR_SPEC.loader.exec_module(curator)
+
 
 POLICY_PATH = Path(__file__).resolve().parents[1] / "references" / "evidence-policy.json"
 
@@ -121,6 +127,22 @@ def make_private_key(item_count=2):
     }
 
 
+def write_ledgers(root: Path, records: list[dict], decisions: list[dict]) -> tuple[Path, Path]:
+    evidence_path = root / "evidence.jsonl"
+    decision_path = root / "decisions.jsonl"
+    if records:
+        evidence_path.write_text(
+            "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in records),
+            encoding="utf-8",
+        )
+    if decisions:
+        decision_path.write_text(
+            "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in decisions),
+            encoding="utf-8",
+        )
+    return evidence_path, decision_path
+
+
 class EvidenceIdentityTests(unittest.TestCase):
     def test_evidence_id_is_stable_across_key_order(self):
         left = {"source_run_id": "hbt-abc", "brief_id": "slam-01", "content_sha256": "a" * 64}
@@ -210,9 +232,14 @@ class RecordValidationTests(unittest.TestCase):
 class ProjectionTests(unittest.TestCase):
     def test_projection_applies_pending_to_active_decision(self):
         record = make_record(evidence_type="guard", status="pending_review")
+        parent = make_record(
+            evidence_type="evaluation_observation",
+            evidence_id="ev-" + "2" * 24,
+            status="pending_review",
+        )
         decision = make_decision(record["evidence_id"], "active")
 
-        state = evidence_vault.project_state([record], [decision])
+        state = evidence_vault.project_state([parent, record], [decision])
 
         self.assertEqual(state[record["evidence_id"]]["status"], "active")
 
@@ -221,7 +248,7 @@ class ProjectionTests(unittest.TestCase):
             evidence_vault.project_state([], [make_decision("ev-" + "3" * 24, "active")])
 
     def test_projection_rejects_invalid_transition(self):
-        record = make_record(status="rejected")
+        record = make_record(evidence_type="evaluation_observation", status="rejected")
 
         with self.assertRaisesRegex(ValueError, "invalid transition"):
             evidence_vault.project_state([record], [make_decision(record["evidence_id"], "active")])
@@ -257,6 +284,215 @@ class LedgerAndPolicyTests(unittest.TestCase):
         self.assertEqual(policy["schema"], "mind-vault-evidence-policy/v1")
         self.assertEqual(policy["policy_version"], "2026-08-19.1")
         self.assertIn("spoken_delivery", policy["allowed_scopes"])
+
+
+class CurationTests(unittest.TestCase):
+    def test_create_active_guard_writes_pending_record_then_active_decision(self):
+        observation = make_record(evidence_type="evaluation_observation", status="pending_review")
+        with tempfile.TemporaryDirectory() as directory:
+            evidence_path, decision_path = write_ledgers(Path(directory), [observation], [])
+
+            result = curator.create_derived(
+                evidence_path=evidence_path,
+                decision_path=decision_path,
+                kind="guard",
+                genres=["slam"],
+                scopes=["spoken_delivery"],
+                directive="A slam egyszeri hallásra követhető, kimondható előadói ívet tartson.",
+                guard_level="hard",
+                confidence="high",
+                basis="Explicit human feedback from slam-03.",
+                parent_ids=[observation["evidence_id"]],
+                activate=True,
+            )
+
+            state = evidence_vault.project_state(
+                evidence_vault.read_jsonl(evidence_path), evidence_vault.read_jsonl(decision_path)
+            )
+            self.assertEqual(state[result["evidence_id"]]["status"], "active")
+            self.assertEqual(len(evidence_vault.read_jsonl(evidence_path)), 2)
+            self.assertEqual(len(evidence_vault.read_jsonl(decision_path)), 1)
+
+    def test_derived_record_rejects_non_observation_parent(self):
+        parent = make_record(evidence_type="guard", status="active")
+
+        with self.assertRaisesRegex(ValueError, "evaluation_observation"):
+            curator.build_derived_record(
+                kind="guard",
+                genres=["slam"],
+                scopes=["spoken_delivery"],
+                directive="A slam legyen egyszeri hallásra követhető.",
+                guard_level="hard",
+                confidence="high",
+                basis="Explicit human feedback.",
+                parents=[parent],
+            )
+
+    def test_decision_rejects_missing_curation_reason(self):
+        with self.assertRaisesRegex(ValueError, "curation reason is required"):
+            curator.build_decision("ev-" + "1" * 24, "active", "   ")
+
+    def test_derived_record_rejects_unknown_scope(self):
+        parent = make_record(evidence_type="evaluation_observation")
+
+        with self.assertRaisesRegex(ValueError, "scope"):
+            curator.build_derived_record(
+                kind="guard",
+                genres=["slam"],
+                scopes=["unrecognized_scope"],
+                directive="A slam legyen egyszeri hallásra követhető.",
+                guard_level="hard",
+                confidence="high",
+                basis="Explicit human feedback.",
+                parents=[parent],
+            )
+
+    def test_derived_record_rejects_invalid_guard_level(self):
+        parent = make_record(evidence_type="evaluation_observation")
+
+        with self.assertRaisesRegex(ValueError, "guard level"):
+            curator.build_derived_record(
+                kind="guard",
+                genres=["slam"],
+                scopes=["spoken_delivery"],
+                directive="A slam legyen egyszeri hallásra követhető.",
+                guard_level="mandatory",
+                confidence="high",
+                basis="Explicit human feedback.",
+                parents=[parent],
+            )
+
+    def test_derived_record_rejects_duplicate_parent_ids(self):
+        parent = make_record(evidence_type="evaluation_observation")
+
+        with self.assertRaisesRegex(ValueError, "duplicate parent"):
+            curator.build_derived_record(
+                kind="guard",
+                genres=["slam"],
+                scopes=["spoken_delivery"],
+                directive="A slam legyen egyszeri hallásra követhető.",
+                guard_level="hard",
+                confidence="high",
+                basis="Explicit human feedback.",
+                parents=[parent, parent],
+            )
+
+    def test_rejected_record_cannot_transition_to_active(self):
+        record = make_record(evidence_type="evaluation_observation", status="rejected")
+
+        with self.assertRaisesRegex(ValueError, "invalid transition"):
+            evidence_vault.project_state([record], [make_decision(record["evidence_id"], "active")])
+
+    def test_active_derived_record_requires_observation_parent(self):
+        record = make_record(
+            evidence_type="mechanism",
+            authority="genre_mechanism",
+            status="pending_review",
+            provenance={
+                "source_kind": "curated_evaluation_observations",
+                "source_run_id": "curation-01",
+                "source_item_id": "derived-rule",
+                "brief_id": "curated-derived",
+                "source_sha256": "b" * 64,
+                "parent_evidence_ids": ["ev-" + "2" * 24],
+            },
+        )
+        parent = make_record(
+            evidence_type="utility_observation",
+            authority="utility_only",
+            status="active",
+            evidence_id="ev-" + "2" * 24,
+        )
+
+        with self.assertRaisesRegex(ValueError, "evaluation_observation"):
+            evidence_vault.project_state(
+                [parent, record], [make_decision(record["evidence_id"], "active")]
+            )
+
+    def test_supersedes_rejects_missing_or_non_active_record(self):
+        observation = make_record(evidence_type="evaluation_observation", evidence_id="ev-" + "2" * 24)
+        record = make_record(
+            evidence_type="guard",
+            status="pending_review",
+            supersedes=["ev-" + "3" * 24],
+        )
+
+        with self.assertRaisesRegex(ValueError, "supersedes.*missing"):
+            evidence_vault.project_state([observation, record], [make_decision(record["evidence_id"], "active")])
+
+        retired = make_record(
+            evidence_type="evaluation_observation",
+            evidence_id="ev-" + "3" * 24,
+            status="retired",
+        )
+        with self.assertRaisesRegex(ValueError, "supersedes.*active"):
+            evidence_vault.project_state([observation, retired, record], [make_decision(record["evidence_id"], "active")])
+
+    def test_create_derived_validates_final_state_before_writing(self):
+        observation = make_record(evidence_type="evaluation_observation", status="pending_review")
+        with tempfile.TemporaryDirectory() as directory:
+            evidence_path, decision_path = write_ledgers(
+                Path(directory), [observation], [make_decision(observation["evidence_id"], "rejected")]
+            )
+            before_evidence = evidence_path.read_bytes()
+            before_decisions = decision_path.read_bytes()
+
+            with self.assertRaisesRegex(ValueError, "evaluation_observation"):
+                curator.create_derived(
+                    evidence_path=evidence_path,
+                    decision_path=decision_path,
+                    kind="guard",
+                    genres=["slam"],
+                    scopes=["spoken_delivery"],
+                    directive="A slam legyen egyszeri hallásra követhető.",
+                    guard_level="hard",
+                    confidence="high",
+                    basis="Explicit human feedback.",
+                    parent_ids=[observation["evidence_id"]],
+                    activate=True,
+                )
+
+            self.assertEqual(evidence_path.read_bytes(), before_evidence)
+            self.assertEqual(decision_path.read_bytes(), before_decisions)
+
+    def test_create_derived_is_idempotent_after_activation(self):
+        observation = make_record(evidence_type="evaluation_observation", status="pending_review")
+        arguments = {
+            "kind": "guard",
+            "genres": ["slam"],
+            "scopes": ["spoken_delivery"],
+            "directive": "A slam legyen egyszeri hallásra követhető.",
+            "guard_level": "hard",
+            "confidence": "high",
+            "basis": "Explicit human feedback.",
+            "parent_ids": [observation["evidence_id"]],
+            "activate": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            evidence_path, decision_path = write_ledgers(Path(directory), [observation], [])
+            first = curator.create_derived(evidence_path=evidence_path, decision_path=decision_path, **arguments)
+            evidence_after_first = evidence_path.read_bytes()
+            decisions_after_first = decision_path.read_bytes()
+            second = curator.create_derived(evidence_path=evidence_path, decision_path=decision_path, **arguments)
+
+            self.assertEqual(second["evidence_id"], first["evidence_id"])
+            self.assertEqual(evidence_path.read_bytes(), evidence_after_first)
+            self.assertEqual(decision_path.read_bytes(), decisions_after_first)
+
+    def test_parent_selector_pairs_must_resolve_exactly_once(self):
+        first = make_record(evidence_type="evaluation_observation", evidence_id="ev-" + "2" * 24)
+        second = make_record(evidence_type="evaluation_observation", evidence_id="ev-" + "3" * 24)
+        second["provenance"]["source_run_id"] = first["provenance"]["source_run_id"]
+        second["provenance"]["brief_id"] = first["provenance"]["brief_id"]
+
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            curator.resolve_parent_ids(
+                [first, second], [first["provenance"]["source_run_id"]], [first["provenance"]["brief_id"]]
+            )
+        with self.assertRaisesRegex(ValueError, "equal lengths"):
+            curator.resolve_parent_ids([first], ["hbt-abc"], [])
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            curator.resolve_parent_ids([first], ["hbt-missing"], ["slam-missing"])
 
 
 class HumanBlindImportTests(unittest.TestCase):

@@ -129,8 +129,8 @@ def validate_record(record: dict) -> None:
 
     if record["status"] == "active" and record["evidence_type"] in {"guard", "mechanism"} and not scope:
         raise ValueError("active guard or mechanism requires scope")
-    if record["status"] == "active" and record["evidence_type"] == "guard" and not parent_ids:
-        raise ValueError("active guard requires parent evidence")
+    if record["status"] == "active" and record["evidence_type"] in {"guard", "mechanism"} and not parent_ids:
+        raise ValueError("active derived evidence requires parent evidence")
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -205,6 +205,25 @@ def project_state(records: list[dict], decisions: list[dict]) -> dict[str, dict]
         validate_record(projected)
         state[evidence_id] = projected
         previous_decision_at[evidence_id] = decided_at
+    for evidence_id, record in state.items():
+        if record["status"] == "active" and record["evidence_type"] in {"guard", "mechanism"}:
+            for parent_id in record["provenance"]["parent_evidence_ids"]:
+                parent = state.get(parent_id)
+                if parent is None:
+                    raise ValueError(f"active derived evidence has missing parent: {parent_id}")
+                if (
+                    parent["evidence_type"] != "evaluation_observation"
+                    or parent["status"] not in {"pending_review", "active"}
+                ):
+                    raise ValueError(
+                        f"active derived evidence parent must be a pending or active evaluation_observation: {parent_id}"
+                    )
+        for superseded_id in record["supersedes"]:
+            superseded = state.get(superseded_id)
+            if superseded is None:
+                raise ValueError(f"supersedes references missing evidence: {superseded_id}")
+            if superseded["status"] != "active":
+                raise ValueError(f"supersedes must reference active evidence: {superseded_id}")
     return state
 
 
