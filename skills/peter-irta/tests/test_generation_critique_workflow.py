@@ -1,7 +1,11 @@
+import copy
 import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -45,6 +49,66 @@ def engine_packet(state="cold-start"):
     }
 
 
+def v1_packet():
+    packet = engine_packet()
+    packet["schema"] = "mind-vault-engine-packet/v1"
+    return packet
+
+
+def v2_packet_with_curated_evidence():
+    packet = engine_packet()
+    packet["schema"] = "mind-vault-engine-packet/v2"
+    packet["evidence_policy"] = {
+        "schema": "mind-vault-evidence-policy/v1",
+        "policy_version": "policy-7",
+        "state": "manual_policy_cold_start",
+        "ledger_sha256": "a" * 64,
+    }
+    packet["selected_evidence"] = {
+        "voice": [],
+        "mechanisms": [
+            {
+                "evidence_id": "ev-mechanism",
+                "genre": ["slam"],
+                "scope": ["spoken_delivery"],
+                "directive": "Építs visszatérő színpadi motívumot.",
+                "level": "soft",
+                "confidence": "high",
+                "score": 1.7,
+                "reasons": ["human reason"],
+                "observation": "private observation",
+                "parent_evidence_ids": ["ev-private-parent"],
+                "source_path": "C:/private/evidence.jsonl",
+            }
+        ],
+        "guards": [
+            {
+                "evidence_id": "ev-hard-guard",
+                "genre": ["slam"],
+                "scope": ["output_surface"],
+                "directive": "Ne használj Markdown címsort nem Markdown célfelületen.",
+                "level": "hard",
+                "confidence": "high",
+                "score": 2.1,
+                "reasons": ["human reason"],
+                "observation": "private observation",
+                "parent_evidence_ids": ["ev-private-parent"],
+                "source_path": "C:/private/evidence.jsonl",
+            },
+            {
+                "evidence_id": "ev-soft-guard",
+                "genre": ["slam"],
+                "scope": ["spoken_delivery"],
+                "directive": "Lehetőleg rövidítsd a levegőtlen mondatokat.",
+                "level": "soft",
+                "confidence": "medium",
+                "reasons": ["human reason"],
+            },
+        ],
+    }
+    return packet
+
+
 def producer_portfolio():
     return {
         "run_id": "engine-run-actual",
@@ -79,6 +143,96 @@ def producer_portfolio():
 
 
 class GenerationCritiqueWorkflowTests(unittest.TestCase):
+    def test_v2_workflow_transfers_only_sanitized_curated_rules(self):
+        public, private = workflow.build_workflow(v2_packet_with_curated_evidence(), "seed-1")
+
+        expected_guard = {
+            "evidence_id": "ev-hard-guard",
+            "genre": ["slam"],
+            "scope": ["output_surface"],
+            "directive": "Ne használj Markdown címsort nem Markdown célfelületen.",
+            "level": "hard",
+            "confidence": "high",
+        }
+        self.assertEqual(public["generation_job"]["curated_guards"][0], expected_guard)
+        self.assertEqual(public["critique_job"]["curated_guards"][0], expected_guard)
+        rendered_public = json.dumps(public, ensure_ascii=False)
+        rendered_private = json.dumps(private, ensure_ascii=False)
+        for secret in ("human reason", "private observation", "ev-private-parent", "C:/private/evidence.jsonl"):
+            self.assertNotIn(secret, rendered_public)
+            self.assertNotIn(secret, rendered_private)
+        self.assertEqual(private["engine_packet_schema"], "mind-vault-engine-packet/v2")
+        self.assertEqual(private["evidence_policy_version"], "policy-7")
+        self.assertEqual(private["evidence_ledger_sha256"], "a" * 64)
+        self.assertFalse(private["learned_preference_claimed"])
+
+    def test_v1_packet_keeps_existing_public_job_shape_with_empty_curated_lists(self):
+        public, private = workflow.build_workflow(v1_packet(), "seed-1")
+
+        self.assertEqual(public["generation_job"]["curated_mechanisms"], [])
+        self.assertEqual(public["generation_job"]["curated_guards"], [])
+        self.assertEqual(public["critique_job"]["curated_mechanisms"], [])
+        self.assertEqual(public["critique_job"]["curated_guards"], [])
+        self.assertEqual(private["engine_packet_schema"], "mind-vault-engine-packet/v1")
+        self.assertIsNone(private["evidence_policy_version"])
+        self.assertIsNone(private["evidence_ledger_sha256"])
+
+    def test_curated_guard_identity_changes_with_id_or_directive(self):
+        original = v2_packet_with_curated_evidence()
+        changed_id = copy.deepcopy(original)
+        changed_id["selected_evidence"]["guards"][0]["evidence_id"] = "ev-other-guard"
+        changed_directive = copy.deepcopy(original)
+        changed_directive["selected_evidence"]["guards"][0]["directive"] = "Másik guard."
+
+        original_public, _ = workflow.build_workflow(original, "seed-1")
+        changed_id_public, _ = workflow.build_workflow(changed_id, "seed-1")
+        changed_directive_public, _ = workflow.build_workflow(changed_directive, "seed-1")
+
+        self.assertNotEqual(original_public["workflow_id"], changed_id_public["workflow_id"])
+        self.assertNotEqual(original_public["workflow_id"], changed_directive_public["workflow_id"])
+
+    def test_only_hard_curated_guards_become_release_checks(self):
+        public, _ = workflow.build_workflow(v2_packet_with_curated_evidence(), "seed-1")
+
+        checks = public["critique_job"]["genre_quality_contract"]["release_checks"]
+        curated_checks = [item for item in checks if item["id"].startswith("curated:")]
+        self.assertEqual(
+            curated_checks,
+            [
+                {
+                    "id": "curated:ev-hard-guard",
+                    "question": "Ne használj Markdown címsort nem Markdown célfelületen.",
+                    "hard": True,
+                }
+            ],
+        )
+        self.assertEqual(len(public["generation_job"]["curated_guards"]), 2)
+
+    def test_unknown_engine_packet_schema_is_rejected(self):
+        packet = v1_packet()
+        packet["schema"] = "mind-vault-engine-packet/v99"
+
+        with self.assertRaisesRegex(ValueError, "Unsupported Engine packet schema"):
+            workflow.build_workflow(packet, "seed-1")
+
+    def test_cli_requires_explicit_engine_packet_schema(self):
+        packet = engine_packet()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            packet_path = root / "packet.json"
+            packet_path.write_text(json.dumps(packet, ensure_ascii=False), encoding="utf-8")
+            argv = [
+                "generation_critique_workflow.py",
+                "--engine-packet",
+                str(packet_path),
+                "--output-dir",
+                str(root / "output"),
+            ]
+
+            with mock.patch.object(sys, "argv", argv):
+                with self.assertRaisesRegex(SystemExit, "explicit supported schema"):
+                    workflow.main()
+
     def test_workflow_is_deterministic_and_links_generation_to_critique(self):
         first, _ = workflow.build_workflow(engine_packet())
         second, _ = workflow.build_workflow(engine_packet())

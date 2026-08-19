@@ -18,6 +18,11 @@ EVALUATION_DIMENSIONS = {
     "originality_anti_caricature": "Önálló megoldás Péter-manírok katalógusa nélkül.",
 }
 
+SUPPORTED_ENGINE_SCHEMAS = {
+    "mind-vault-engine-packet/v1",
+    "mind-vault-engine-packet/v2",
+}
+
 
 def _stable_digest(payload: dict) -> str:
     rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -26,6 +31,31 @@ def _stable_digest(payload: dict) -> str:
 
 def _execution_sources(packet: dict) -> list[dict]:
     return list(packet.get("evidence_compiler", {}).get("execution_evidence") or [])[:4]
+
+
+def _engine_schema(packet: dict, *, require_explicit: bool = False) -> str:
+    schema = packet.get("schema")
+    if schema is None or schema == "":
+        if require_explicit:
+            raise ValueError("Engine packet must declare an explicit supported schema")
+        return "mind-vault-engine-packet/v1"
+    if not isinstance(schema, str) or schema not in SUPPORTED_ENGINE_SCHEMAS:
+        raise ValueError(f"Unsupported Engine packet schema: {schema}")
+    return schema
+
+
+def _curated_evidence(packet: dict) -> tuple[list[dict], list[dict]]:
+    selected = packet.get("selected_evidence") or {}
+    fields = ("evidence_id", "genre", "scope", "directive", "level", "confidence")
+    mechanisms = [
+        {key: item.get(key) for key in fields if item.get(key) is not None}
+        for item in selected.get("mechanisms") or []
+    ]
+    guards = [
+        {key: item.get(key) for key in fields if item.get(key) is not None}
+        for item in selected.get("guards") or []
+    ]
+    return mechanisms, guards
 
 
 def _public_evidence(packet: dict) -> list[dict]:
@@ -55,11 +85,23 @@ def _public_evidence(packet: dict) -> list[dict]:
 
 
 def build_workflow(packet: dict, variation_seed: str = "") -> tuple[dict, dict]:
+    engine_schema = _engine_schema(packet)
     plan = packet.get("brief_plan") or {}
     genre = normalize_genre(str((plan.get("genre") or {}).get("value") or ""))
     if not genre:
         raise ValueError("Engine packet has no brief_plan.genre.value")
     contract = genre_quality_contract(genre)
+    critique_contract = genre_quality_contract(genre)
+    curated_mechanisms, curated_guards = _curated_evidence(packet)
+    critique_contract["release_checks"].extend(
+        {
+            "id": f"curated:{guard['evidence_id']}",
+            "question": guard.get("directive", ""),
+            "hard": True,
+        }
+        for guard in curated_guards
+        if guard.get("level") == "hard"
+    )
     public_evidence = _public_evidence(packet)
     seed = variation_seed or str(packet.get("retrieval", {}).get("variation_seed") or "default")
     identity = {
@@ -68,6 +110,8 @@ def build_workflow(packet: dict, variation_seed: str = "") -> tuple[dict, dict]:
         "genre": genre,
         "seed": seed,
         "evidence": public_evidence,
+        "curated_mechanisms": curated_mechanisms,
+        "curated_guards": curated_guards,
         "contract": contract,
     }
     workflow_id = f"generation-critique-{_stable_digest(identity)}"
@@ -84,6 +128,8 @@ def build_workflow(packet: dict, variation_seed: str = "") -> tuple[dict, dict]:
             "audience": (plan.get("audience") or {}).get("value", ""),
             "negative_preferences": plan.get("negative_preferences") or [],
             "evidence_sources": public_evidence,
+            "curated_mechanisms": curated_mechanisms,
+            "curated_guards": curated_guards,
             "dialogue_calibration": (packet.get("channels") or {}).get("dialogue") or {},
             "generation_contract": packet.get("evidence_compiler", {}).get("generation_contract") or {},
             "genre_quality_contract": contract,
@@ -93,8 +139,10 @@ def build_workflow(packet: dict, variation_seed: str = "") -> tuple[dict, dict]:
             "job_id": f"{workflow_id}-critique",
             "input_contract": "A generation_job draftja változtatás nélkül.",
             "genre": genre,
+            "curated_mechanisms": curated_mechanisms,
+            "curated_guards": curated_guards,
             "dimensions": EVALUATION_DIMENSIONS,
-            "genre_quality_contract": contract,
+            "genre_quality_contract": critique_contract,
             "required_output": [
                 "dimension_scores",
                 "hard_guard_failures",
@@ -112,6 +160,9 @@ def build_workflow(packet: dict, variation_seed: str = "") -> tuple[dict, dict]:
     private = {
         "schema_version": 1,
         "workflow_id": workflow_id,
+        "engine_packet_schema": engine_schema,
+        "evidence_policy_version": (packet.get("evidence_policy") or {}).get("policy_version"),
+        "evidence_ledger_sha256": (packet.get("evidence_policy") or {}).get("ledger_sha256"),
         "engine_run_id": (
             packet.get("retrieval_run_id")
             or packet.get("retrieval", {}).get("run_id")
@@ -147,6 +198,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     packet = json.loads(args.engine_packet.read_text(encoding="utf-8-sig"))
+    try:
+        _engine_schema(packet, require_explicit=True)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     workflow, private = build_workflow(packet, args.variation_seed)
     if args.draft:
         workflow = attach_draft(workflow, args.draft.read_text(encoding="utf-8-sig"))
