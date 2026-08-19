@@ -99,6 +99,9 @@ def validate_record(record: dict) -> None:
     scope = _require_string_list(record.get("scope"), "scope")
     if not isinstance(record.get("content"), dict):
         raise ValueError("content must be an object")
+    if record["evidence_type"] in {"guard", "mechanism"} and "polarity" in record["content"]:
+        if record["content"]["polarity"] not in {"require", "forbid", "prefer"}:
+            raise ValueError("content.polarity must be require, forbid, or prefer")
 
     provenance = record.get("provenance")
     if not isinstance(provenance, dict):
@@ -383,7 +386,14 @@ def _ranked(records: list[dict], plan: dict, policy: dict) -> list[tuple[dict, f
         score, reasons = score_derived(record, plan, policy)
         if _genre_match(record, plan):
             scored.append((record, score, reasons))
-    return sorted(scored, key=lambda item: (-item[1], str(item[0].get("evidence_id") or "")))
+    return sorted(
+        scored,
+        key=lambda item: (
+            {"exact": 0, "global": 1}[_genre_match(item[0], plan)],
+            -item[1],
+            str(item[0].get("evidence_id") or ""),
+        ),
+    )
 
 
 def _guard_conflicts(guards: list[dict], plan: dict) -> tuple[set[str], list[dict]]:
@@ -451,7 +461,17 @@ def select_evidence(portfolio: dict, plan: dict, projected: dict[str, dict], pol
         ("mechanism", _selected_derived(record, score, reasons)) for record, score, reasons in selected_mechanisms
     ]
     selection_trace = [
-        {"channel": channel, "evidence_id": item["evidence_id"], "score": item["score"], "reasons": item["reasons"]}
+        {
+            "channel": channel,
+            "evidence_id": item["evidence_id"],
+            "genre_tier": next(
+                _genre_match(record, plan)
+                for record, _, _ in (selected_guards if channel == "guard" else selected_mechanisms)
+                if record.get("evidence_id") == item["evidence_id"]
+            ),
+            "score": item["score"],
+            "reasons": item["reasons"],
+        }
         for channel, item in selected_derived
     ]
     selection_trace.extend(

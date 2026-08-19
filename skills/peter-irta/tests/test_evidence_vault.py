@@ -228,6 +228,13 @@ class RecordValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "status"):
             evidence_vault.validate_record(make_record(status="published"))
 
+    def test_derived_guard_allows_missing_legacy_polarity(self):
+        evidence_vault.validate_record(make_record(content={"directive": "Legacy directive."}))
+
+    def test_derived_guard_rejects_invalid_explicit_polarity(self):
+        with self.assertRaisesRegex(ValueError, "polarity"):
+            evidence_vault.validate_record(make_record(content={"directive": "Directive.", "polarity": "must"}))
+
 
 class ProjectionTests(unittest.TestCase):
     def test_projection_applies_pending_to_active_decision(self):
@@ -685,6 +692,25 @@ class SelectorTests(unittest.TestCase):
         selected = self.select([global_item, slam_item])
 
         self.assertEqual(selected["mechanisms"][0]["evidence_id"], slam_item["evidence_id"])
+
+    def test_exact_genre_precedes_higher_scoring_global_mechanism(self):
+        exact = active_derived("mechanism", 1, genres=("slam",), scopes=("campaign_coherence",))
+        exact["confidence"]["level"] = "low"
+        global_item = active_derived("mechanism", 2, genres=("global",), scopes=("spoken_delivery",))
+
+        selected = self.select([global_item, exact])
+        trace_by_id = {item["evidence_id"]: item for item in selected["selection_trace"]}
+
+        self.assertLess(
+            next(item["score"] for item in selected["mechanisms"] if item["evidence_id"] == exact["evidence_id"]),
+            next(item["score"] for item in selected["mechanisms"] if item["evidence_id"] == global_item["evidence_id"]),
+        )
+        self.assertEqual(
+            [item["evidence_id"] for item in selected["mechanisms"]],
+            [exact["evidence_id"], global_item["evidence_id"]],
+        )
+        self.assertEqual(trace_by_id[exact["evidence_id"]]["genre_tier"], "exact")
+        self.assertIn("genre:exact", trace_by_id[exact["evidence_id"]]["reasons"])
 
     def test_conflicting_guards_are_reported_and_both_excluded(self):
         require = active_derived("guard", 1, genres=("cikk",), scopes=("output_surface_markdown",), polarity="require")
