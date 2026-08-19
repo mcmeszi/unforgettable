@@ -14,11 +14,16 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
+from evidence_vault import load_policy, project_state, read_jsonl, select_evidence
+
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 VAULT_QUERY = SKILL_ROOT / "scripts" / "vault_query.py"
 AUTHOR_SHEETS = SKILL_ROOT / "state" / "author-writing-sheets.json"
-ENGINE_SCHEMA = "mind-vault-engine-packet/v1"
+EVIDENCE_LEDGER = SKILL_ROOT / "state" / "evidence-vault" / "evidence.jsonl"
+DECISION_LEDGER = SKILL_ROOT / "state" / "evidence-vault" / "decisions.jsonl"
+EVIDENCE_POLICY = SKILL_ROOT / "references" / "evidence-policy.json"
+ENGINE_SCHEMA = "mind-vault-engine-packet/v2"
 
 GENRE_ALIASES = {
     "beszed": ("beszéd", "speech", "előadás", "előadói"),
@@ -221,11 +226,64 @@ def negative_channel(portfolio: dict, writing_sheet: dict, plan: dict, dialogue:
     }
 
 
-def compile_engine_packet(portfolio: dict, plan: dict) -> dict:
+def fallback_evidence_policy(state: str) -> dict:
+    """Return a deterministic selector policy without reading runtime state."""
+    return {
+        "schema": "mind-vault-evidence-policy/v1",
+        "policy_version": "unavailable",
+        "state": state,
+        "authority_weights": {},
+        "confidence_weights": {},
+        "selection_limits": {"voice": 5, "mechanisms": 0, "soft_guards": 0},
+        "genre_exact_bonus": 0.0,
+        "genre_global_bonus": 0.0,
+        "scope_brief_match_bonus": 0.0,
+        "allowed_scopes": [],
+    }
+
+
+def derived_mechanism_transfer(item: dict) -> dict:
+    """Adapt one sanitized selector result without carrying RAG source text."""
+    return {
+        "id": item["evidence_id"],
+        "title": "Curated mechanism",
+        "channel": "curated-evidence",
+        "portfolio_role": "derived-mechanism",
+        "mechanism": item["directive"],
+        "technique_tags": list(item.get("scope") or []),
+        "transfer_instruction": item["directive"],
+        "evidence": [],
+        "derived": True,
+    }
+
+
+def compile_engine_packet(
+    portfolio: dict,
+    plan: dict,
+    *,
+    evidence_records: list[dict] | None = None,
+    evidence_decisions: list[dict] | None = None,
+    evidence_policy: dict | None = None,
+) -> dict:
     writing_sheet = portfolio.get("author_writing_sheet") or {}
     dialogue = dialogue_channel(writing_sheet, plan)
     reranker = rerank_execution_sources(portfolio)
     negatives = negative_channel(portfolio, writing_sheet, plan, dialogue)
+    state_absent = evidence_records is None or evidence_decisions is None or evidence_policy is None
+    active_policy = evidence_policy or fallback_evidence_policy("state_absent")
+    projected = {} if state_absent else project_state(evidence_records, evidence_decisions)
+    selection = select_evidence(portfolio, plan, projected, active_policy)
+    evidence_state = "state_absent" if state_absent else active_policy["state"]
+    execution_evidence = list(reranker["ranked"])
+    execution_evidence.extend(derived_mechanism_transfer(item) for item in selection["mechanisms"])
+    negatives["guards"] = list(
+        dict.fromkeys(
+            [
+                *negatives["guards"],
+                *(item["directive"] for item in selection["guards"] if item["directive"].strip()),
+            ]
+        )
+    )
     sources = portfolio.get("sources") or []
     content = [source for source in sources if source.get("retrieval_channel") == "content"]
     style = [source for source in sources if source.get("retrieval_channel") == "style"]
@@ -257,8 +315,21 @@ def compile_engine_packet(portfolio: dict, plan: dict) -> dict:
             "negative_examples": negatives,
         },
         "preference_reranker": reranker,
+        "evidence_policy": {
+            "schema": active_policy["schema"],
+            "policy_version": active_policy["policy_version"],
+            "state": evidence_state,
+            "ledger_sha256": selection["ledger_sha256"],
+        },
+        "selected_evidence": {
+            "voice": selection["voice"],
+            "mechanisms": selection["mechanisms"],
+            "guards": selection["guards"],
+        },
+        "selection_trace": selection["selection_trace"],
+        "conflicts": selection["conflicts"],
         "evidence_compiler": {
-            "execution_evidence": reranker["ranked"],
+            "execution_evidence": execution_evidence,
             "generation_contract": {
                 "authority_order": dialogue.get("precedence"),
                 "do": [
@@ -342,12 +413,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--rag-root", type=Path)
     parser.add_argument("--vault-query", type=Path, default=VAULT_QUERY)
+    parser.add_argument("--evidence-ledger", type=Path, default=EVIDENCE_LEDGER)
+    parser.add_argument("--decision-ledger", type=Path, default=DECISION_LEDGER)
+    parser.add_argument("--evidence-policy", type=Path, default=EVIDENCE_POLICY)
+    parser.add_argument("--no-derived-evidence", action="store_true")
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.no_derived_evidence:
+        evidence_records: list[dict] | None = []
+        evidence_decisions: list[dict] | None = []
+        evidence_policy = fallback_evidence_policy("disabled_explicitly")
+    else:
+        try:
+            evidence_policy = load_policy(args.evidence_policy)
+            evidence_records = read_jsonl(args.evidence_ledger)
+            evidence_decisions = read_jsonl(args.decision_ledger)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        if not args.evidence_ledger.is_file() or not args.decision_ledger.is_file():
+            evidence_records = None
+            evidence_decisions = None
     plan = plan_brief(
         args.brief,
         genre=args.genre,
@@ -358,7 +447,16 @@ def main() -> int:
         target_axes=parse_axis(args.target_axis),
     )
     portfolio = run_vault_query(plan, args)
-    packet = compile_engine_packet(portfolio, plan)
+    try:
+        packet = compile_engine_packet(
+            portfolio,
+            plan,
+            evidence_records=evidence_records,
+            evidence_decisions=evidence_decisions,
+            evidence_policy=evidence_policy,
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     rendered = json.dumps(packet, ensure_ascii=False, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

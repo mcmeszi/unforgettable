@@ -1,7 +1,11 @@
+import argparse
 import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -18,6 +22,91 @@ def load_module(name):
 
 
 engine = load_module("mind_vault_engine")
+
+
+def policy(state="manual_policy_cold_start"):
+    return {
+        "schema": "mind-vault-evidence-policy/v1",
+        "policy_version": "test-policy-v1",
+        "state": state,
+        "authority_weights": {"genre_mechanism": 0.7, "generation_guard": 0.7},
+        "confidence_weights": {"low": 0.1, "medium": 0.2, "high": 0.3},
+        "selection_limits": {"voice": 5, "mechanisms": 3, "soft_guards": 3},
+        "genre_exact_bonus": 0.5,
+        "genre_global_bonus": 0.1,
+        "scope_brief_match_bonus": 0.4,
+        "allowed_scopes": ["spoken_delivery", "output_surface_markdown"],
+    }
+
+
+def observation():
+    return {
+        "schema": "mind-vault-evidence/v1",
+        "evidence_id": "ev-" + "f" * 24,
+        "evidence_type": "evaluation_observation",
+        "status": "pending_review",
+        "authority": "evaluation_only",
+        "genre": ["slam"],
+        "scope": [],
+        "content": {"observation": "PRIVATE HUMAN OBSERVATION"},
+        "provenance": {
+            "source_kind": "human_blind_evaluation",
+            "source_run_id": "test-run",
+            "source_item_id": "test-item",
+            "brief_id": "test-brief",
+            "source_sha256": "a" * 64,
+            "parent_evidence_ids": [],
+        },
+        "confidence": {"level": "high", "basis": "test fixture"},
+        "created_at": "2026-08-19T08:00:00Z",
+        "supersedes": [],
+    }
+
+
+def active_derived(kind, number, directive, *, genre="slam", scope="spoken_delivery",
+                   level="soft", polarity="prefer"):
+    return {
+        "schema": "mind-vault-evidence/v1",
+        "evidence_id": f"ev-{number:024x}",
+        "evidence_type": kind,
+        "status": "active",
+        "authority": "generation_guard" if kind == "guard" else "genre_mechanism",
+        "genre": [genre],
+        "scope": [scope],
+        "content": {
+            "directive": directive,
+            "level": level,
+            "polarity": polarity,
+            "observation": "PRIVATE HUMAN OBSERVATION",
+        },
+        "provenance": {
+            "source_kind": "curated_evaluation_derivative",
+            "source_run_id": "test-run",
+            "source_item_id": f"derived-{number}",
+            "brief_id": "test-brief",
+            "source_sha256": f"{number:064x}",
+            "parent_evidence_ids": [observation()["evidence_id"]],
+        },
+        "confidence": {"level": "high", "basis": "test fixture"},
+        "created_at": "2026-08-19T08:01:00Z",
+        "supersedes": [],
+    }
+
+
+def plan(brief="Írj slamet spoken deliveryre.", genre="slam"):
+    return engine.plan_brief(brief, genre=genre)
+
+
+def cli_args(root, *, no_derived_evidence=False):
+    return argparse.Namespace(
+        brief="Írj slamet.", genre="slam", purpose="", audience="", query="",
+        dialogue="auto", target_axis=[], variation_seed="", limit=0, rag_root=None,
+        vault_query=engine.VAULT_QUERY, output=root / "packet.json",
+        evidence_ledger=root / "evidence.jsonl",
+        decision_ledger=root / "decisions.jsonl",
+        evidence_policy=root / "policy.json",
+        no_derived_evidence=no_derived_evidence,
+    )
 
 
 def portfolio(transfer_strength="conditional", utility=0.0):
@@ -99,6 +188,98 @@ class BriefPlannerTests(unittest.TestCase):
 
 
 class EnginePacketTests(unittest.TestCase):
+    def test_packet_v2_exposes_selected_evidence_and_manual_cold_start(self):
+        guard = active_derived("guard", 1, "Tartsd kimondhatónak.", level="hard")
+
+        packet = engine.compile_engine_packet(
+            portfolio(),
+            plan(),
+            evidence_records=[observation(), guard],
+            evidence_decisions=[],
+            evidence_policy=policy(),
+        )
+
+        self.assertEqual(packet["schema"], "mind-vault-engine-packet/v2")
+        self.assertEqual(packet["evidence_policy"]["state"], "manual_policy_cold_start")
+        self.assertEqual(packet["selected_evidence"]["guards"][0]["scope"], ["spoken_delivery"])
+        self.assertEqual(packet["preference_reranker"]["state"], "cold-start")
+
+    def test_selected_mechanism_and_guard_transfer_only_sanitized_directives(self):
+        mechanism = active_derived("mechanism", 2, "Építs visszatérő színpadi motívumot.")
+        guard = active_derived("guard", 3, "Kerüld a felolvashatatlan mondatokat.", level="hard")
+
+        packet = engine.compile_engine_packet(
+            portfolio(),
+            plan(),
+            evidence_records=[observation(), mechanism, guard],
+            evidence_decisions=[],
+            evidence_policy=policy(),
+        )
+
+        transferred = packet["evidence_compiler"]["execution_evidence"][-1]
+        self.assertEqual(transferred["id"], mechanism["evidence_id"])
+        self.assertEqual(transferred["transfer_instruction"], mechanism["content"]["directive"])
+        self.assertEqual(transferred["evidence"], [])
+        self.assertTrue(transferred["derived"])
+        self.assertNotIn("utility_weight", transferred)
+        self.assertNotIn("preference_score", transferred)
+        self.assertEqual(
+            packet["channels"]["negative_examples"]["guards"][-1],
+            guard["content"]["directive"],
+        )
+        self.assertNotIn("PRIVATE HUMAN OBSERVATION", json.dumps(packet, ensure_ascii=False))
+
+    def test_non_matching_genre_derived_evidence_stays_out_of_slam_packet(self):
+        article = active_derived("mechanism", 4, "Használj cikkes alcímeket.", genre="cikk")
+
+        packet = engine.compile_engine_packet(
+            portfolio(),
+            plan(),
+            evidence_records=[observation(), article],
+            evidence_decisions=[],
+            evidence_policy=policy(),
+        )
+
+        self.assertEqual(packet["selected_evidence"]["mechanisms"], [])
+        self.assertNotIn(article["evidence_id"], [item["id"] for item in packet["evidence_compiler"]["execution_evidence"]])
+
+    def test_guard_conflicts_are_copied_and_not_transferred(self):
+        required = active_derived(
+            "guard", 5, "Használj Markdown alcímeket.", genre="cikk",
+            scope="output_surface_markdown", polarity="require",
+        )
+        forbidden = active_derived(
+            "guard", 6, "Ne használj Markdown alcímeket.", genre="cikk",
+            scope="output_surface_markdown", polarity="forbid",
+        )
+
+        packet = engine.compile_engine_packet(
+            portfolio(),
+            plan("Írj cikket markdown outputtal.", genre="cikk"),
+            evidence_records=[observation(), required, forbidden],
+            evidence_decisions=[],
+            evidence_policy=policy(),
+        )
+
+        self.assertEqual(packet["selected_evidence"]["guards"], [])
+        self.assertEqual(
+            packet["conflicts"][0]["evidence_ids"],
+            sorted([required["evidence_id"], forbidden["evidence_id"]]),
+        )
+        guards = packet["channels"]["negative_examples"]["guards"]
+        self.assertNotIn(required["content"]["directive"], guards)
+        self.assertNotIn(forbidden["content"]["directive"], guards)
+
+    def test_missing_derived_state_preserves_legacy_selection(self):
+        packet = engine.compile_engine_packet(portfolio(), plan())
+
+        self.assertEqual(
+            [item["id"] for item in packet["evidence_compiler"]["execution_evidence"]],
+            [item["id"] for item in packet["preference_reranker"]["ranked"]],
+        )
+        self.assertEqual(packet["selected_evidence"]["mechanisms"], [])
+        self.assertEqual(packet["evidence_policy"]["state"], "state_absent")
+
     def test_conditional_dialogue_is_only_active_for_dialogue_brief(self):
         quiet = engine.plan_brief("Írj slamet a hajnalról.")
         active = engine.plan_brief("Írj slamet, amely egy kérdésre válaszol.")
@@ -165,6 +346,46 @@ class EnginePacketTests(unittest.TestCase):
         rendered = str(packet).casefold()
         self.assertNotIn("slack_message", rendered)
         self.assertNotIn("channel_id", rendered)
+
+
+class EngineCliTests(unittest.TestCase):
+    def test_malformed_explicit_ledgers_report_file_and_line(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+            cases = (
+                ("evidence.jsonl", "decisions.jsonl"),
+                ("decisions.jsonl", "evidence.jsonl"),
+            )
+            for malformed_name, valid_name in cases:
+                with self.subTest(ledger=malformed_name):
+                    (root / malformed_name).write_text("{}\n{broken", encoding="utf-8")
+                    (root / valid_name).write_text("", encoding="utf-8")
+                    args = cli_args(root)
+                    with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                        engine, "run_vault_query", return_value=portfolio()
+                    ):
+                        with self.assertRaises(SystemExit) as raised:
+                            engine.main()
+                    message = str(raised.exception)
+                    self.assertIn(str(root / malformed_name), message)
+                    self.assertIn("line 2", message)
+
+    def test_no_derived_evidence_skips_files_and_emits_empty_disabled_layer(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for filename in ("evidence.jsonl", "decisions.jsonl", "policy.json"):
+                (root / filename).write_text("{broken", encoding="utf-8")
+            args = cli_args(root, no_derived_evidence=True)
+            with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                engine, "run_vault_query", return_value=portfolio()
+            ), mock.patch("builtins.print"):
+                self.assertEqual(engine.main(), 0)
+
+            packet = json.loads(args.output.read_text(encoding="utf-8"))
+            self.assertEqual(packet["evidence_policy"]["state"], "disabled_explicitly")
+            self.assertEqual(packet["selected_evidence"]["mechanisms"], [])
+            self.assertEqual(packet["selected_evidence"]["guards"], [])
 
 
 if __name__ == "__main__":
