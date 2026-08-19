@@ -31,6 +31,9 @@ CURATOR_SPEC.loader.exec_module(curator)
 
 
 POLICY_PATH = Path(__file__).resolve().parents[1] / "references" / "evidence-policy.json"
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+ENGINE_V3_DOC_PATH = SKILL_ROOT / "references" / "engine-v3.md"
+SKILL_DOC_PATH = SKILL_ROOT / "SKILL.md"
 
 
 def make_record(**overrides):
@@ -1000,6 +1003,33 @@ class HumanBlindImportTests(unittest.TestCase):
             self.assertEqual(report["added_records"], 0)
             self.assertEqual(report["existing_records"], 2)
             self.assertRegex(report["ledger_sha256"], r"^[0-9a-f]{64}$")
+
+
+class DocumentationContractTests(unittest.TestCase):
+    def test_live_evidence_workflow_and_safety_contract_are_documented(self):
+        engine_documentation = ENGINE_V3_DOC_PATH.read_text(encoding="utf-8")
+        skill_documentation = SKILL_DOC_PATH.read_text(encoding="utf-8")
+
+        engine_contracts = (
+            "curate_evidence.py",
+            "--evidence-ledger skills/peter-irta/state/evidence-vault/evidence.jsonl",
+            "--decision-ledger skills/peter-irta/state/evidence-vault/decisions.jsonl",
+            "nem ír automatikusan retrieval-utility",
+        )
+        for contract in engine_contracts:
+            with self.subTest(document="engine-v3.md", contract=contract):
+                self.assertIn(contract, engine_documentation)
+
+        skill_contracts = (
+            "evidence_policy",
+            "selected_evidence",
+            "selection_trace",
+            "conflicts",
+            "manual_policy_cold_start",
+        )
+        for contract in skill_contracts:
+            with self.subTest(document="SKILL.md", contract=contract):
+                self.assertIn(contract, skill_documentation)
 
 
 if __name__ == "__main__":

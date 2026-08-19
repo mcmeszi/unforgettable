@@ -169,3 +169,100 @@ retrieval-utility bejegyzést, nem állít elő voice-feedback ledgerbejegyzést
 nem hoz létre tanult preference-et; az eredményben ezért
 `utility_written=false`, `learned_preference_claimed=false` és
 `feedback_review_required=true` szerepel.
+
+## Finalizált emberi evidence importja és kézi kurálása
+
+Az alábbi parancsokat a `kisagy` repository gyökeréből futtasd. A finalizált
+eredményt és a hozzá tartozó private keyt immutable inputként kezeld: az import
+csak a lokális, gitignore-olt evidence ledgerhez fűz új `pending_review`
+megfigyeléseket.
+
+```powershell
+python skills/peter-irta/scripts/import_human_blind_feedback.py `
+  --result skills/peter-irta/state/human-blind-test-30/human-test-result.json `
+  --private-key skills/peter-irta/state/human-blind-test-30/private-human-key.json `
+  --ledger skills/peter-irta/state/evidence-vault/evidence.jsonl
+```
+
+A `pending_review` megfigyelések kilistázása:
+
+```powershell
+python skills/peter-irta/scripts/curate_evidence.py list `
+  --evidence-ledger skills/peter-irta/state/evidence-vault/evidence.jsonl `
+  --decision-ledger skills/peter-irta/state/evidence-vault/decisions.jsonl
+```
+
+Egy guard létrehozása és ugyanabban a tranzakcióban történő aktiválása:
+
+```powershell
+python skills/peter-irta/scripts/curate_evidence.py create-derived `
+  --evidence-ledger skills/peter-irta/state/evidence-vault/evidence.jsonl `
+  --decision-ledger skills/peter-irta/state/evidence-vault/decisions.jsonl `
+  --type guard `
+  --genre slam `
+  --scope spoken_delivery `
+  --scope speaker_coherence `
+  --directive "A slam egyszeri hallásra követhető, kimondható előadói ívet tartson; a beszélők viszonya és minden megszólalás gazdája legyen világos." `
+  --guard-level hard `
+  --confidence high `
+  --basis "Kurált emberi feedback: slam-03." `
+  --parent-run hbt-db17d34b356b8f33f6d3dcf2 `
+  --parent-brief slam-03 `
+  --activate
+```
+
+Mechanizmusnál ugyanaz a folyamat, de `--type mechanism` kell, és nincs
+`--guard-level`:
+
+```powershell
+python skills/peter-irta/scripts/curate_evidence.py create-derived `
+  --evidence-ledger skills/peter-irta/state/evidence-vault/evidence.jsonl `
+  --decision-ledger skills/peter-irta/state/evidence-vault/decisions.jsonl `
+  --type mechanism `
+  --genre reklam `
+  --scope first_obvious_ad_concept `
+  --scope campaign_coherence `
+  --directive "Az első evidens koncepciót vizsgáld felül, majd az insight–koncepció–kibontás–CTA láncot egyetlen stratégiai csavarrá zárd." `
+  --confidence high `
+  --basis "Kurált emberi feedback: reklam-02, reklam-03." `
+  --parent-run hbt-db17d34b356b8f33f6d3dcf2 `
+  --parent-brief reklam-02 `
+  --parent-run hbt-db17d34b356b8f33f6d3dcf2 `
+  --parent-brief reklam-03 `
+  --activate
+```
+
+Több szülőnél minden briefhez külön, azonos sorrendű `--parent-run` és
+`--parent-brief` párt adj. Egy azonos `create-derived --activate` parancs
+ismétlése ugyanazt az evidence ID-t adja vissza, és nem ír duplikált rekordot
+vagy döntést.
+
+Az Engine alapértelmezésben beolvassa az aktív derived evidence-et:
+
+```powershell
+python skills/peter-irta/scripts/mind_vault_engine.py `
+  --brief "Írj egyszeri hallásra követhető slamet." `
+  --genre slam `
+  --evidence-ledger skills/peter-irta/state/evidence-vault/evidence.jsonl `
+  --decision-ledger skills/peter-irta/state/evidence-vault/decisions.jsonl `
+  --output skills/peter-irta/state/engine-packet.json
+```
+
+Összehasonlító kontrollként szándékosan ki lehet kapcsolni a derived
+evidence-et. A `--no-derived-evidence` nem fallback hiba esetére, hanem explicit
+kontrollfutás:
+
+```powershell
+python skills/peter-irta/scripts/mind_vault_engine.py `
+  --brief "Írj egyszeri hallásra követhető slamet." `
+  --genre slam `
+  --evidence-ledger skills/peter-irta/state/evidence-vault/evidence.jsonl `
+  --decision-ledger skills/peter-irta/state/evidence-vault/decisions.jsonl `
+  --no-derived-evidence `
+  --output skills/peter-irta/state/engine-packet-no-derived.json
+```
+
+A human-blind import és a `curate_evidence.py` kézi review nem ír automatikusan retrieval-utility
+vagy voice-feedback bejegyzést. Utility kizárólag a meglévő, explicit emberi
+elfogadási/elutasítási folyamatból származhat; a curated rule aktiválása önmagában
+nem tanult preference.
