@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from evidence_vault import (
+    _validate_decision,
     canonical_sha256,
     load_policy,
     project_state,
@@ -356,8 +357,6 @@ def load_validated_evidence_ledgers(
     """Read ledgers and project each causal row with path-and-line diagnostics."""
     evidence_records, evidence_rows = _jsonl_rows(evidence_path)
     evidence_decisions, decision_rows = _jsonl_rows(decision_path)
-    if not evidence_path.is_file() or not decision_path.is_file():
-        return evidence_records, evidence_decisions
 
     content_by_id: dict[str, str] = {}
     record_by_id: dict[str, dict] = {}
@@ -373,6 +372,15 @@ def load_validated_evidence_ledgers(
             raise _ledger_error(evidence_path, line_number, error) from error
         content_by_id.setdefault(evidence_id, content_hash)
         record_by_id.setdefault(evidence_id, record)
+
+    for line_number, decision in decision_rows:
+        try:
+            _validate_decision(decision)
+        except ValueError as error:
+            raise _ledger_error(decision_path, line_number, error) from error
+
+    if not evidence_path.is_file() or not decision_path.is_file():
+        return evidence_records, evidence_decisions
 
     for line_number, record in evidence_rows:
         if record["status"] == "active" and record["evidence_type"] in {"guard", "mechanism"}:

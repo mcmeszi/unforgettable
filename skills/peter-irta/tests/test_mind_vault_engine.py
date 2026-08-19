@@ -427,6 +427,65 @@ class EngineCliTests(unittest.TestCase):
             self.assertIn(str(args.decision_ledger), message)
             self.assertIn("line 3", message)
 
+    def test_invalid_existing_evidence_is_rejected_when_decision_ledger_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+            (root / "evidence.jsonl").write_text("{}\n", encoding="utf-8")
+            args = cli_args(root)
+
+            with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                engine, "run_vault_query", return_value=portfolio()
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    engine.main()
+
+            message = str(raised.exception)
+            self.assertIn(str(args.evidence_ledger), message)
+            self.assertIn("line 1", message)
+
+    def test_invalid_existing_decision_is_rejected_when_evidence_ledger_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+            (root / "decisions.jsonl").write_text("{}\n", encoding="utf-8")
+            args = cli_args(root)
+
+            with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                engine, "run_vault_query", return_value=portfolio()
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    engine.main()
+
+            message = str(raised.exception)
+            self.assertIn(str(args.decision_ledger), message)
+            self.assertIn("line 1", message)
+
+    def test_valid_existing_ledger_with_missing_counterpart_emits_state_absent(self):
+        cases = (
+            ("evidence.jsonl", observation()),
+            (
+                "decisions.jsonl",
+                decision("ev-" + "d" * 24, "active"),
+            ),
+        )
+        for ledger_name, item in cases:
+            with self.subTest(existing=ledger_name), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                (root / "policy.json").write_text(json.dumps(policy()), encoding="utf-8")
+                (root / ledger_name).write_text(json.dumps(item) + "\n", encoding="utf-8")
+                args = cli_args(root)
+
+                with mock.patch.object(engine, "parse_args", return_value=args), mock.patch.object(
+                    engine, "run_vault_query", return_value=portfolio()
+                ), mock.patch("builtins.print"):
+                    self.assertEqual(engine.main(), 0)
+
+                packet = json.loads(args.output.read_text(encoding="utf-8"))
+                self.assertEqual(packet["evidence_policy"]["state"], "state_absent")
+                self.assertEqual(packet["selected_evidence"]["mechanisms"], [])
+                self.assertEqual(packet["selected_evidence"]["guards"], [])
+
     def test_projection_errors_report_the_causal_ledger_row(self):
         base_observation = observation()
         conflicting_duplicate = observation()
