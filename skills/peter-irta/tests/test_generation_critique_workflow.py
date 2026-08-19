@@ -177,6 +177,34 @@ class GenerationCritiqueWorkflowTests(unittest.TestCase):
         self.assertIsNone(private["evidence_policy_version"])
         self.assertIsNone(private["evidence_ledger_sha256"])
 
+    def test_v1_and_legacy_packets_ignore_injected_v2_selected_evidence(self):
+        selected_evidence = copy.deepcopy(v2_packet_with_curated_evidence()["selected_evidence"])
+        for label, clean_packet in (
+            ("explicit-v1", v1_packet()),
+            ("legacy-missing-schema", engine_packet()),
+        ):
+            with self.subTest(packet=label):
+                injected_packet = copy.deepcopy(clean_packet)
+                injected_packet["selected_evidence"] = selected_evidence
+
+                clean_public, _ = workflow.build_workflow(clean_packet, "seed-1")
+                public, private = workflow.build_workflow(injected_packet, "seed-1")
+
+                self.assertEqual(public["workflow_id"], clean_public["workflow_id"])
+                self.assertEqual(public["generation_job"]["curated_mechanisms"], [])
+                self.assertEqual(public["generation_job"]["curated_guards"], [])
+                self.assertEqual(public["critique_job"]["curated_mechanisms"], [])
+                self.assertEqual(public["critique_job"]["curated_guards"], [])
+                self.assertFalse(
+                    any(
+                        check["id"].startswith("curated:")
+                        for check in public["critique_job"]["genre_quality_contract"]["release_checks"]
+                    )
+                )
+                self.assertEqual(private["engine_packet_schema"], "mind-vault-engine-packet/v1")
+                self.assertIsNone(private["evidence_policy_version"])
+                self.assertIsNone(private["evidence_ledger_sha256"])
+
     def test_curated_guard_identity_changes_with_id_or_directive(self):
         original = v2_packet_with_curated_evidence()
         changed_id = copy.deepcopy(original)

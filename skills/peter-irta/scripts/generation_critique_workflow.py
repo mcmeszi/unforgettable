@@ -92,7 +92,11 @@ def build_workflow(packet: dict, variation_seed: str = "") -> tuple[dict, dict]:
         raise ValueError("Engine packet has no brief_plan.genre.value")
     contract = genre_quality_contract(genre)
     critique_contract = genre_quality_contract(genre)
-    curated_mechanisms, curated_guards = _curated_evidence(packet)
+    curated_mechanisms, curated_guards = (
+        _curated_evidence(packet)
+        if engine_schema == "mind-vault-engine-packet/v2"
+        else ([], [])
+    )
     critique_contract["release_checks"].extend(
         {
             "id": f"curated:{guard['evidence_id']}",
