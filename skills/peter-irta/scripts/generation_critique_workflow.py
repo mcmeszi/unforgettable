@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build reproducible generation and genre-critique jobs from an Engine v3 packet."""
+"""Build reproducible generation and critique jobs from Engine packet schema v1 or v2."""
 
 from __future__ import annotations
 

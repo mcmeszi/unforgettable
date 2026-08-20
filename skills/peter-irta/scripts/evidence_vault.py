@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import time
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +44,89 @@ VOICE_SOURCE_ORIGINS = {
     "source-caption",
     "source-description",
 }
+
+
+class LedgerTransactionLock:
+    """Lock one or more ledgers by canonical path in deadlock-safe order."""
+
+    def __init__(self, *ledger_paths: Path) -> None:
+        if not ledger_paths:
+            raise ValueError("at least one ledger path is required")
+        unique: dict[str, Path] = {}
+        for raw_path in ledger_paths:
+            path = Path(raw_path).expanduser().resolve(strict=False)
+            key = os.path.normcase(str(path))
+            unique[key] = path
+        self.ledger_paths = [unique[key] for key in sorted(unique)]
+        self._files: list[object] = []
+
+    @staticmethod
+    def _lock_path(ledger_path: Path) -> Path:
+        identity = canonical_sha256({"ledger": os.path.normcase(str(ledger_path))})[:20]
+        return ledger_path.parent / f".evidence-ledger-{identity}.lock"
+
+    @staticmethod
+    def _acquire(file: object) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            file.seek(0, os.SEEK_END)
+            if file.tell() == 0:
+                file.write(b"\0")
+                file.flush()
+            while True:
+                try:
+                    file.seek(0)
+                    msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+                    return
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+
+    @staticmethod
+    def _release(file: object) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            file.seek(0)
+            msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+
+    def __enter__(self) -> "LedgerTransactionLock":
+        try:
+            for ledger_path in self.ledger_paths:
+                lock_path = self._lock_path(ledger_path)
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                file = lock_path.open("a+b")
+                try:
+                    self._acquire(file)
+                except Exception:
+                    file.close()
+                    raise
+                self._files.append(file)
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        release_error = None
+        for file in reversed(self._files):
+            try:
+                self._release(file)
+            except Exception as error:  # pragma: no cover - only OS-level lock corruption
+                release_error = release_error or error
+            finally:
+                file.close()
+        self._files.clear()
+        if release_error is not None and exc_type is None:
+            raise release_error
 
 
 def canonical_sha256(value: object) -> str:
@@ -435,13 +520,13 @@ def select_evidence(portfolio: dict, plan: dict, projected: dict[str, dict], pol
         for record in projected.values()
         if record.get("status") == "active" and record.get("evidence_type") in {"guard", "mechanism"}
     ]
-    eligible = [record for record in active if _genre_match(record, plan)]
+    genre_matching = [record for record in active if _genre_match(record, plan)]
     superseded_ids = {
         superseded_id
-        for record in eligible
+        for record in genre_matching
         for superseded_id in record.get("supersedes") or []
     }
-    eligible = [record for record in eligible if record.get("evidence_id") not in superseded_ids]
+    eligible = [record for record in genre_matching if record.get("evidence_id") not in superseded_ids]
     guards = [record for record in eligible if record.get("evidence_type") == "guard"]
     mechanisms = [record for record in eligible if record.get("evidence_type") == "mechanism"]
     conflicting_ids, conflicts = _guard_conflicts(guards, plan)
@@ -453,7 +538,8 @@ def select_evidence(portfolio: dict, plan: dict, projected: dict[str, dict], pol
     limits = policy.get("selection_limits") or {}
     selected_guards = hard_guards + soft_guards[:int(limits.get("soft_guards", 3))]
     selected_mechanisms = _ranked(mechanisms, plan, policy)[:int(limits.get("mechanisms", 3))]
-    voice = adapt_voice_sources(portfolio)[:int(limits.get("voice", 5))]
+    voice_candidates = adapt_voice_sources(portfolio)
+    voice = voice_candidates[:int(limits.get("voice", 5))]
 
     selected_derived = [
         ("guard", _selected_derived(record, score, reasons)) for record, score, reasons in selected_guards
@@ -471,12 +557,69 @@ def select_evidence(portfolio: dict, plan: dict, projected: dict[str, dict], pol
             ),
             "score": item["score"],
             "reasons": item["reasons"],
+            "selected": True,
+            "exclusion_reason": None,
         }
         for channel, item in selected_derived
     ]
     selection_trace.extend(
-        {"channel": "voice", "evidence_id": item["evidence_id"], "original_rank": item["original_rank"]}
+        {
+            "channel": "voice",
+            "evidence_id": item["evidence_id"],
+            "original_rank": item["original_rank"],
+            "selected": True,
+            "exclusion_reason": None,
+        }
         for item in voice
+    )
+
+    selected_guard_ids = {record["evidence_id"] for record, _, _ in selected_guards}
+    selected_mechanism_ids = {record["evidence_id"] for record, _, _ in selected_mechanisms}
+    for record in sorted(projected.values(), key=lambda item: str(item.get("evidence_id") or "")):
+        evidence_id = str(record.get("evidence_id") or "")
+        evidence_type = str(record.get("evidence_type") or "")
+        if evidence_id in selected_guard_ids or evidence_id in selected_mechanism_ids:
+            continue
+        row = {
+            "channel": evidence_type if evidence_type in {"guard", "mechanism"} else evidence_type or "derived",
+            "evidence_id": evidence_id,
+            "selected": False,
+        }
+        if evidence_type not in {"guard", "mechanism"}:
+            row["exclusion_reason"] = "unsupported_type"
+        elif record.get("status") != "active":
+            row["exclusion_reason"] = "inactive"
+        else:
+            genre_tier = _genre_match(record, plan)
+            score, reasons = score_derived(record, plan, policy)
+            row.update({
+                "genre_tier": genre_tier or None,
+                "score": round(score, 8),
+                "reasons": reasons,
+            })
+            if not genre_tier:
+                row["exclusion_reason"] = "genre_mismatch"
+            elif evidence_id in superseded_ids:
+                row["exclusion_reason"] = "superseded"
+            elif evidence_id in conflicting_ids:
+                row["exclusion_reason"] = "conflict"
+            elif evidence_type == "guard":
+                row["exclusion_reason"] = "soft_guard_limit"
+            elif evidence_type == "mechanism":
+                row["exclusion_reason"] = "mechanism_limit"
+            else:  # pragma: no cover - evidence type is exhausted above
+                row["exclusion_reason"] = "not_selected"
+        selection_trace.append(row)
+
+    selection_trace.extend(
+        {
+            "channel": "voice",
+            "evidence_id": item["evidence_id"],
+            "original_rank": item["original_rank"],
+            "selected": False,
+            "exclusion_reason": "voice_limit",
+        }
+        for item in voice_candidates[len(voice):]
     )
     return {
         "voice": voice,

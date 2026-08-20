@@ -246,6 +246,20 @@ class EnginePacketTests(unittest.TestCase):
         )
         self.assertNotIn("PRIVATE HUMAN OBSERVATION", json.dumps(packet, ensure_ascii=False))
 
+    def test_curated_guard_deduplicates_an_identical_legacy_guard(self):
+        directive = "Ne legyen kötelező kérdéshalmozás."
+        guard = active_derived("guard", 29, directive, level="hard")
+
+        packet = engine.compile_engine_packet(
+            portfolio(),
+            plan(),
+            evidence_records=[observation(), guard],
+            evidence_decisions=[],
+            evidence_policy=policy(),
+        )
+
+        self.assertEqual(packet["channels"]["negative_examples"]["guards"].count(directive), 1)
+
     def test_non_matching_genre_derived_evidence_stays_out_of_slam_packet(self):
         article = active_derived("mechanism", 4, "Használj cikkes alcímeket.", genre="cikk")
 
@@ -286,6 +300,32 @@ class EnginePacketTests(unittest.TestCase):
         guards = packet["channels"]["negative_examples"]["guards"]
         self.assertNotIn(required["content"]["directive"], guards)
         self.assertNotIn(forbidden["content"]["directive"], guards)
+
+    def test_packet_selection_trace_explains_excluded_candidates(self):
+        selected_guard = active_derived("guard", 30, "Aktív hard guard.", level="hard")
+        inactive = active_derived("guard", 31, "Függő guard.")
+        inactive["status"] = "pending_review"
+        mismatch = active_derived("mechanism", 32, "Cikkes mechanizmus.", genre="cikk")
+        mechanisms = [
+            active_derived("mechanism", number, f"Mechanizmus {number}.")
+            for number in range(33, 37)
+        ]
+
+        packet = engine.compile_engine_packet(
+            portfolio(),
+            plan(),
+            evidence_records=[observation(), selected_guard, inactive, mismatch, *mechanisms],
+            evidence_decisions=[],
+            evidence_policy=policy(),
+        )
+        trace = {row["evidence_id"]: row for row in packet["selection_trace"]}
+
+        self.assertTrue(trace[selected_guard["evidence_id"]]["selected"])
+        self.assertEqual(trace[inactive["evidence_id"]]["exclusion_reason"], "inactive")
+        self.assertEqual(trace[mismatch["evidence_id"]]["exclusion_reason"], "genre_mismatch")
+        self.assertEqual(trace[mechanisms[-1]["evidence_id"]]["exclusion_reason"], "mechanism_limit")
+        self.assertEqual(trace[observation()["evidence_id"]]["exclusion_reason"], "unsupported_type")
+        self.assertNotIn("PRIVATE HUMAN OBSERVATION", json.dumps(packet["selection_trace"], ensure_ascii=False))
 
     def test_missing_derived_state_preserves_legacy_selection(self):
         packet = engine.compile_engine_packet(portfolio(), plan())

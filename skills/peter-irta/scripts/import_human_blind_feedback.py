@@ -14,6 +14,7 @@ from pathlib import Path
 
 from evidence_vault import (
     EVIDENCE_SCHEMA,
+    LedgerTransactionLock,
     canonical_sha256,
     derive_evidence_id,
     read_jsonl,
@@ -23,6 +24,42 @@ from evidence_vault import (
 
 SYSTEMS = {"engine_v3", "legacy"}
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CHOICES = {"left", "right", "tie"}
+SIDE_ADJECTIVE_RE = re.compile(
+    r"(?P<article>\b(?:a|az)\s+)?"
+    r"(?P<side>bal|jobb)\s*oldal"
+    r"(?P<form>i(?:ban|ben|nál|nél|hoz|hez|höz|nak|nek|ról|ről|ra|re|ként|on|en|ön|t|n)?|o)\b",
+    re.IGNORECASE,
+)
+STANDALONE_SIDE_RE = re.compile(
+    r"(?P<article>\b(?:a|az)\s+)(?P<side>bal|jobb)\b(?=\s*[,.;:!?])",
+    re.IGNORECASE,
+)
+SYSTEM_LABELS = {"engine_v3": "Engine v3-változat", "legacy": "legacy-változat"}
+HUNGARIAN_SIDE_KEYS = {"bal": "left", "jobb": "right"}
+FORM_SUFFIXES = {
+    "i": "",
+    "iban": "ban",
+    "iben": "ban",
+    "inál": "nál",
+    "inél": "nál",
+    "ihoz": "hoz",
+    "ihez": "hoz",
+    "ihöz": "hoz",
+    "inak": "nak",
+    "inek": "nak",
+    "iról": "ról",
+    "iről": "ról",
+    "ira": "ra",
+    "ire": "ra",
+    "iként": "ként",
+    "ion": "on",
+    "ien": "on",
+    "iön": "on",
+    "it": "ot",
+    "in": "on",
+    "o": "",
+}
 
 
 def _require_text(value: object, field: str) -> str:
@@ -54,6 +91,7 @@ def validate_human_result(result: dict) -> None:
     if result.get("schema_version") != 1:
         raise ValueError("human result schema_version must be 1")
     _require_text(result.get("run_id"), "run_id")
+    _require_sha256(result.get("private_sha256"), "private_sha256")
     _parse_finalized_at(result.get("finalized_at"))
     if "finalized" in result and result["finalized"] is not True:
         raise ValueError("finalized must be true when present")
@@ -88,12 +126,15 @@ def validate_human_result(result: dict) -> None:
         item_ids.add(item_id)
         brief_ids.add(brief_id)
 
+        choice = item.get("choice")
+        if choice not in CHOICES:
+            raise ValueError("choice must be left, right, or tie")
         chosen_system = item.get("chosen_system")
         if chosen_system is not None and chosen_system not in SYSTEMS:
             raise ValueError("chosen_system must be engine_v3, legacy, or null")
-        if item.get("choice") == "tie" and chosen_system is not None:
+        if choice == "tie" and chosen_system is not None:
             raise ValueError("tie choice must not have a chosen_system")
-        if item.get("choice") != "tie" and chosen_system is None:
+        if choice != "tie" and chosen_system is None:
             raise ValueError("non-tie choice must have a chosen_system")
 
         flags = item.get("flags")
@@ -125,6 +166,8 @@ def _validate_private_key(result: dict, private_key: dict) -> None:
     mappings = private_key.get("items")
     if not isinstance(mappings, dict):
         raise ValueError("private key items must be an object")
+    if canonical_sha256(private_key) != result["private_sha256"]:
+        raise ValueError("private_sha256 does not match the canonical private key")
     result_item_ids = {item["item_id"] for item in result["items"]}
     if set(mappings) != result_item_ids:
         raise ValueError("private key items do not match human result items")
@@ -134,6 +177,40 @@ def _validate_private_key(result: dict, private_key: dict) -> None:
             raise ValueError("private key brief_id does not match human result")
         if {mapping.get("left"), mapping.get("right")} != SYSTEMS:
             raise ValueError("private key has invalid system mapping")
+        choice = item["choice"]
+        expected_system = None if choice == "tie" else mapping[choice]
+        if item["chosen_system"] != expected_system:
+            raise ValueError("choice and chosen_system disagree with the private key mapping")
+
+
+def _system_reference(system: str, form: str, *, capitalized: bool) -> str:
+    label = SYSTEM_LABELS[system] + FORM_SUFFIXES[form.casefold()]
+    if capitalized and label[:1].islower():
+        return label[:1].upper() + label[1:]
+    return label
+
+
+def _sanitize_feedback_text(value: str, side_map: dict) -> str:
+    """Replace blind-test candidate positions while preserving ordinary spatial wording."""
+    def replace_adjective(match: re.Match) -> str:
+        system = side_map[HUNGARIAN_SIDE_KEYS[match.group("side").casefold()]]
+        article = match.group("article")
+        label = _system_reference(system, match.group("form"), capitalized=article is None and match.group(0)[0].isupper())
+        if article is None:
+            return label
+        replacement_article = "az" if system == "engine_v3" else "a"
+        if article[0].isupper():
+            replacement_article = replacement_article[:1].upper() + replacement_article[1:]
+        return f"{replacement_article} {label}"
+
+    def replace_standalone(match: re.Match) -> str:
+        system = side_map[HUNGARIAN_SIDE_KEYS[match.group("side").casefold()]]
+        article = "az" if system == "engine_v3" else "a"
+        if match.group("article")[0].isupper():
+            article = article[:1].upper() + article[1:]
+        return f"{article} {SYSTEM_LABELS[system]}"
+
+    return STANDALONE_SIDE_RE.sub(replace_standalone, SIDE_ADJECTIVE_RE.sub(replace_adjective, value))
 
 
 def _make_observation(identity: dict, content: dict, item: dict, result_sha: str, created_at: str) -> dict:
@@ -178,12 +255,19 @@ def build_observation_records(result: dict, private_key: dict) -> list[dict]:
             side_map[side]: digest
             for side, digest in item["draft_hashes"].items()
         }
+        candidate_feedback = {
+            system: {
+                field: _sanitize_feedback_text(text, side_map)
+                for field, text in feedback.items()
+            }
+            for system, feedback in (item.get("candidate_feedback") or {}).items()
+        }
         content = {
             "chosen_system": item["chosen_system"],
-            "reason": item["reason"],
+            "reason": _sanitize_feedback_text(item["reason"], side_map),
             "flags": list(item.get("flags") or []),
-            "general_note": item.get("general_note", ""),
-            "candidate_feedback": json.loads(json.dumps(item.get("candidate_feedback") or {})),
+            "general_note": _sanitize_feedback_text(item.get("general_note", ""), side_map),
+            "candidate_feedback": candidate_feedback,
             "draft_sha256_by_system": draft_hashes,
         }
         identity = {
@@ -197,57 +281,70 @@ def build_observation_records(result: dict, private_key: dict) -> list[dict]:
     return records
 
 
-def append_new_records(records: list[dict], ledger: Path) -> int:
-    """Atomically add unseen immutable records, leaving existing entries untouched."""
-    ledger = Path(ledger)
+def _append_new_records(records: list[dict], ledger: Path) -> dict:
+    """Append under the shared ledger lock and return one consistent write report."""
+    ledger = Path(ledger).expanduser().resolve(strict=False)
     if not isinstance(records, list):
         raise ValueError("records must be a list")
     for record in records:
         validate_record(record)
 
-    existing_records = read_jsonl(ledger)
-    existing_by_id = {}
-    for record in existing_records:
-        validate_record(record)
-        record_hash = canonical_sha256(record)
-        existing_hash = existing_by_id.get(record["evidence_id"])
-        if existing_hash is not None and existing_hash != record_hash:
-            raise ValueError(f"duplicate evidence_id with different canonical content: {record['evidence_id']}")
-        existing_by_id[record["evidence_id"]] = record_hash
-
-    new_records = []
-    for record in records:
-        record_hash = canonical_sha256(record)
-        existing_hash = existing_by_id.get(record["evidence_id"])
-        if existing_hash is None:
+    with LedgerTransactionLock(ledger):
+        existing_records = read_jsonl(ledger)
+        existing_by_id = {}
+        for record in existing_records:
+            validate_record(record)
+            record_hash = canonical_sha256(record)
+            existing_hash = existing_by_id.get(record["evidence_id"])
+            if existing_hash is not None and existing_hash != record_hash:
+                raise ValueError(f"duplicate evidence_id with different canonical content: {record['evidence_id']}")
             existing_by_id[record["evidence_id"]] = record_hash
-            new_records.append(record)
-        elif existing_hash != record_hash:
-            raise ValueError(f"duplicate evidence_id with different canonical content: {record['evidence_id']}")
-    if not new_records:
-        return 0
 
-    ledger.parent.mkdir(parents=True, exist_ok=True)
-    existing_bytes = ledger.read_bytes() if ledger.is_file() else b""
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{ledger.name}.", suffix=".tmp", dir=ledger.parent)
-    try:
-        with os.fdopen(descriptor, "wb") as temporary:
-            temporary.write(existing_bytes)
-            if existing_bytes and not existing_bytes.endswith(b"\n"):
-                temporary.write(b"\n")
-            for record in new_records:
-                payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                temporary.write(payload.encode("utf-8") + b"\n")
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_name, ledger)
-    except Exception:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-        raise
-    return len(new_records)
+        new_records = []
+        for record in records:
+            record_hash = canonical_sha256(record)
+            existing_hash = existing_by_id.get(record["evidence_id"])
+            if existing_hash is None:
+                existing_by_id[record["evidence_id"]] = record_hash
+                new_records.append(record)
+            elif existing_hash != record_hash:
+                raise ValueError(f"duplicate evidence_id with different canonical content: {record['evidence_id']}")
+
+        if new_records:
+            ledger.parent.mkdir(parents=True, exist_ok=True)
+            existing_bytes = ledger.read_bytes() if ledger.is_file() else b""
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{ledger.name}.", suffix=".tmp", dir=ledger.parent
+            )
+            try:
+                with os.fdopen(descriptor, "wb") as temporary:
+                    temporary.write(existing_bytes)
+                    if existing_bytes and not existing_bytes.endswith(b"\n"):
+                        temporary.write(b"\n")
+                    for record in new_records:
+                        payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                        temporary.write(payload.encode("utf-8") + b"\n")
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                os.replace(temporary_name, ledger)
+            except Exception:
+                try:
+                    os.unlink(temporary_name)
+                except FileNotFoundError:
+                    pass
+                raise
+
+        ledger_bytes = ledger.read_bytes() if ledger.is_file() else b""
+        return {
+            "added_records": len(new_records),
+            "existing_records": len(existing_records),
+            "ledger_sha256": hashlib.sha256(ledger_bytes).hexdigest(),
+        }
+
+
+def append_new_records(records: list[dict], ledger: Path) -> int:
+    """Atomically add unseen immutable records, leaving existing entries untouched."""
+    return int(_append_new_records(records, ledger)["added_records"])
 
 
 def _load_json(path: Path, label: str) -> dict:
@@ -262,10 +359,6 @@ def _load_json(path: Path, label: str) -> dict:
     return value
 
 
-def _ledger_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes() if path.is_file() else b"").hexdigest()
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--result", required=True, type=Path)
@@ -276,16 +369,15 @@ def main(argv: list[str] | None = None) -> int:
         result = _load_json(args.result, "human result")
         private_key = _load_json(args.private_key, "private key")
         records = build_observation_records(result, private_key)
-        existing_records = len(read_jsonl(args.ledger))
-        added_records = append_new_records(records, args.ledger)
+        append_report = _append_new_records(records, args.ledger)
     except ValueError as error:
         parser.error(str(error))
     print(json.dumps({
         "source_run_id": result["run_id"],
         "input_items": len(records),
-        "added_records": added_records,
-        "existing_records": existing_records,
-        "ledger_sha256": _ledger_sha256(args.ledger),
+        "added_records": append_report["added_records"],
+        "existing_records": append_report["existing_records"],
+        "ledger_sha256": append_report["ledger_sha256"],
     }, ensure_ascii=False, sort_keys=True))
     return 0
 

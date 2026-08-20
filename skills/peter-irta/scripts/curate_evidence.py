@@ -7,7 +7,6 @@ import argparse
 import json
 import os
 import tempfile
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +15,7 @@ from evidence_vault import (
     DECISION_SCHEMA,
     EVIDENCE_ID_RE,
     EVIDENCE_SCHEMA,
+    LedgerTransactionLock,
     canonical_sha256,
     derive_evidence_id,
     load_policy,
@@ -28,6 +28,7 @@ from evidence_vault import (
 POLICY_PATH = Path(__file__).resolve().parents[1] / "references" / "evidence-policy.json"
 DERIVED_KINDS = {"guard", "mechanism"}
 GUARD_LEVELS = {"hard", "soft"}
+POLARITIES = {"require", "forbid", "prefer"}
 DECISION_STATUSES = {"active", "rejected", "retired"}
 
 
@@ -48,60 +49,7 @@ def _resolve_distinct_ledger_paths(evidence_path: Path, decision_path: Path) -> 
     return evidence_path, decision_path
 
 
-class _LedgerTransactionLock:
-    """Cross-platform interprocess lock for one ordered ledger-pair transaction."""
-
-    def __init__(self, evidence_path: Path, decision_path: Path) -> None:
-        identity = canonical_sha256({
-            "evidence_ledger": str(evidence_path),
-            "decision_ledger": str(decision_path),
-        })
-        self.path = evidence_path.parent / f".curate-evidence-{identity}.lock"
-        self.file = None
-
-    def __enter__(self) -> "_LedgerTransactionLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = self.path.open("a+b")
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                self.file.seek(0, os.SEEK_END)
-                if self.file.tell() == 0:
-                    self.file.write(b"\0")
-                    self.file.flush()
-                while True:
-                    try:
-                        self.file.seek(0)
-                        msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
-                        break
-                    except OSError:
-                        time.sleep(0.05)
-            else:
-                import fcntl
-
-                fcntl.flock(self.file.fileno(), fcntl.LOCK_EX)
-        except Exception:
-            self.file.close()
-            self.file = None
-            raise
-        return self
-
-    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
-        assert self.file is not None
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                self.file.seek(0)
-                msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
-        finally:
-            self.file.close()
-            self.file = None
+_LedgerTransactionLock = LedgerTransactionLock
 
 
 def _require_text(value: object, field: str) -> str:
@@ -167,6 +115,8 @@ def build_derived_record(
     confidence: str,
     basis: str,
     parents: list[dict],
+    polarity: str | None = None,
+    supersedes: list[dict] | None = None,
 ) -> dict:
     """Build a pending guard or mechanism from explicit observation records only."""
     if kind not in DERIVED_KINDS:
@@ -186,6 +136,10 @@ def build_derived_record(
             raise ValueError("guard level must be hard or soft")
     elif guard_level is not None:
         raise ValueError("guard level is only valid for guards")
+    if polarity is not None and polarity not in POLARITIES:
+        raise ValueError("polarity must be require, forbid, or prefer")
+    if kind == "mechanism" and polarity not in {None, "prefer"}:
+        raise ValueError("mechanism polarity must be prefer when explicit")
     if not isinstance(parents, list) or not parents:
         raise ValueError("derived evidence requires at least one parent observation")
 
@@ -202,9 +156,25 @@ def build_derived_record(
         parent_fingerprints.append({"evidence_id": parent_id, "sha256": canonical_sha256(parent)})
     parent_fingerprints.sort(key=lambda item: item["evidence_id"])
 
+    if supersedes is None:
+        supersedes = []
+    if not isinstance(supersedes, list):
+        raise ValueError("supersedes must be a list of active evidence records")
+    superseded_ids = []
+    for target in supersedes:
+        validate_record(target)
+        if target["status"] != "active":
+            raise ValueError(f"supersedes must reference active evidence: {target['evidence_id']}")
+        if target["evidence_id"] in superseded_ids:
+            raise ValueError("supersedes must not contain duplicate evidence IDs")
+        superseded_ids.append(target["evidence_id"])
+    superseded_ids.sort()
+
     content = {"directive": directive}
     if kind == "guard":
         content["guard_level"] = guard_level
+    if polarity is not None:
+        content["polarity"] = polarity
     provenance = {
         "source_kind": "curated_evaluation_observations",
         "source_run_id": "curation-" + canonical_sha256(parent_fingerprints)[:24],
@@ -225,7 +195,7 @@ def build_derived_record(
         "provenance": provenance,
         "confidence": {"level": confidence, "basis": basis},
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "supersedes": [],
+        "supersedes": superseded_ids,
     }
     record["evidence_id"] = derive_evidence_id(_derived_identity(record))
     validate_record(record)
@@ -333,6 +303,23 @@ def _parent_records(records: list[dict], parent_ids: list[str]) -> list[dict]:
     return [by_id[evidence_id] for evidence_id in parent_ids]
 
 
+def _superseded_records(state: dict[str, dict], evidence_ids: list[str] | None) -> list[dict]:
+    evidence_ids = list(evidence_ids or [])
+    if any(not isinstance(evidence_id, str) or not EVIDENCE_ID_RE.fullmatch(evidence_id) for evidence_id in evidence_ids):
+        raise ValueError("supersedes contains an invalid evidence ID")
+    if len(set(evidence_ids)) != len(evidence_ids):
+        raise ValueError("supersedes must not contain duplicate evidence IDs")
+    targets = []
+    for evidence_id in evidence_ids:
+        target = state.get(evidence_id)
+        if target is None:
+            raise ValueError(f"supersedes references missing evidence: {evidence_id}")
+        if target["status"] != "active":
+            raise ValueError(f"supersedes must reference active evidence: {evidence_id}")
+        targets.append(target)
+    return targets
+
+
 def create_derived(
     evidence_path: Path,
     decision_path: Path,
@@ -345,6 +332,8 @@ def create_derived(
     basis: str,
     parent_ids: list[str],
     activate: bool,
+    polarity: str | None = None,
+    supersedes: list[str] | None = None,
 ) -> dict:
     """Create derived evidence and optionally activate it after final-state validation."""
     evidence_path, decision_path = _resolve_distinct_ledger_paths(evidence_path, decision_path)
@@ -361,6 +350,8 @@ def create_derived(
             basis=basis,
             parent_ids=parent_ids,
             activate=activate,
+            polarity=polarity,
+            supersedes=supersedes,
         )
 
 
@@ -376,14 +367,26 @@ def _create_derived_locked(
     basis: str,
     parent_ids: list[str],
     activate: bool,
+    polarity: str | None = None,
+    supersedes: list[str] | None = None,
 ) -> dict:
     """Run one create-derived transaction while its ledger pair is locked."""
     records = read_jsonl(evidence_path)
     decisions = read_jsonl(decision_path)
     current_state = _project(records, decisions)
     parents = _parent_records(records, parent_ids)
+    superseded = _superseded_records(current_state, supersedes)
     record = build_derived_record(
-        kind, genres, scopes, directive, guard_level, confidence, basis, parents
+        kind,
+        genres,
+        scopes,
+        directive,
+        guard_level,
+        confidence,
+        basis,
+        parents,
+        polarity=polarity,
+        supersedes=superseded,
     )
     existing = next((item for item in records if item["evidence_id"] == record["evidence_id"]), None)
     new_records = []
@@ -495,6 +498,8 @@ def main(argv: list[str] | None = None) -> int:
     create_parser.add_argument("--scope", action="append", required=True)
     create_parser.add_argument("--directive", required=True)
     create_parser.add_argument("--guard-level", choices=sorted(GUARD_LEVELS))
+    create_parser.add_argument("--polarity", choices=sorted(POLARITIES))
+    create_parser.add_argument("--supersedes", action="append", default=[])
     create_parser.add_argument("--confidence", required=True, choices=sorted(CONFIDENCE_LEVELS))
     create_parser.add_argument("--basis", required=True)
     create_parser.add_argument("--parent-run", action="append", default=[])
@@ -529,6 +534,8 @@ def main(argv: list[str] | None = None) -> int:
             scopes=args.scope,
             directive=args.directive,
             guard_level=args.guard_level,
+            polarity=args.polarity,
+            supersedes=args.supersedes,
             confidence=args.confidence,
             basis=args.basis,
             activate=args.activate,

@@ -22,6 +22,10 @@ A `--genre` elhagyható, ha a briefből egyértelműen felismerhető. Bizonytala
 - `channels.dialogue`: kizárólag aggregált Slack-kalibráció, nyers üzenet nélkül;
 - `channels.negative_examples`: műfaji guardok, briefbeli tiltások és valid, de céltól távoli Péter-tartományok;
 - `preference_reranker`: brief-fit + visszamért generation utility, zsugorított és korlátozott súllyal;
+- `evidence_policy`: a statikus policy verziója, cold-start állapota és a projected ledger hash-e;
+- `selected_evidence`: külön voice, mechanism és guard sáv;
+- `selection_trace`: minden vizsgált jelölt privacy-safe sora `selected` és kizárásnál `exclusion_reason` mezővel;
+- `conflicts`: a feloldatlan require–forbid párok, amelyek egyike sem kerül a packet aktív szabályai közé;
 - `evidence_compiler`: a generálásnak átadható 3–5 mechanika, evidence és kötelező korlát.
 
 ## Döntési szabályok
@@ -175,7 +179,9 @@ nem hoz létre tanult preference-et; az eredményben ezért
 Az alábbi parancsokat a `kisagy` repository gyökeréből futtasd. A finalizált
 eredményt és a hozzá tartozó private keyt immutable inputként kezeld: az import
 csak a lokális, gitignore-olt evidence ledgerhez fűz új `pending_review`
-megfigyeléseket.
+megfigyeléseket. Az importer ellenőrzi a private key kanonikus SHA-256 kötését,
+a választás és a privát mapping egyezését, a szabad szöveges bal/jobb
+jelöléseket pedig a mapping alapján rendszernevekre cseréli.
 
 ```powershell
 python skills/peter-irta/scripts/import_human_blind_feedback.py `
@@ -204,6 +210,7 @@ python skills/peter-irta/scripts/curate_evidence.py create-derived `
   --scope speaker_coherence `
   --directive "A slam egyszeri hallásra követhető, kimondható előadói ívet tartson; a beszélők viszonya és minden megszólalás gazdája legyen világos." `
   --guard-level hard `
+  --polarity require `
   --confidence high `
   --basis "Kurált emberi feedback: slam-03." `
   --parent-run hbt-db17d34b356b8f33f6d3dcf2 `
@@ -212,7 +219,7 @@ python skills/peter-irta/scripts/curate_evidence.py create-derived `
 ```
 
 Mechanizmusnál ugyanaz a folyamat, de `--type mechanism` kell, és nincs
-`--guard-level`:
+`--guard-level`; explicit polarityként csak `prefer` használható:
 
 ```powershell
 python skills/peter-irta/scripts/curate_evidence.py create-derived `
@@ -223,6 +230,7 @@ python skills/peter-irta/scripts/curate_evidence.py create-derived `
   --scope first_obvious_ad_concept `
   --scope campaign_coherence `
   --directive "Az első evidens koncepciót vizsgáld felül, majd az insight–koncepció–kibontás–CTA láncot egyetlen stratégiai csavarrá zárd." `
+  --polarity prefer `
   --confidence high `
   --basis "Kurált emberi feedback: reklam-02, reklam-03." `
   --parent-run hbt-db17d34b356b8f33f6d3dcf2 `
@@ -236,6 +244,13 @@ Több szülőnél minden briefhez külön, azonos sorrendű `--parent-run` és
 `--parent-brief` párt adj. Egy azonos `create-derived --activate` parancs
 ismétlése ugyanazt az evidence ID-t adja vissza, és nem ír duplikált rekordot
 vagy döntést.
+
+Guardnál a `--polarity require` kötelezően teljesítendő irányt, a
+`--polarity forbid` konkrét tiltást, a `--polarity prefer` pedig nem bináris
+iránymutatást jelent. Ha egy új értelmezés aktív szabályokat vált fel, minden
+célhoz külön, ismételhető `--supersedes ev-...` argumentumot adj. Hiányzó vagy
+nem aktív cél hard error; a curator nem választ helyetted csendben újabb
+rekordot.
 
 Az Engine alapértelmezésben beolvassa az aktív derived evidence-et:
 
