@@ -35,8 +35,42 @@ STANDALONE_SIDE_RE = re.compile(
     r"(?P<article>\b(?:a|az)\s+)(?P<side>bal|jobb)\b(?=\s*[,.;:!?])",
     re.IGNORECASE,
 )
+HUNGARIAN_POSITION_NOUN_RE = re.compile(
+    r"(?P<article>\b(?:a|az)\s+)(?P<side>bal|jobb)\s+oldalon\s+lévő\s+"
+    r"(?:változat|jelölt|szöveg|verzió|opció|válasz)\b",
+    re.IGNORECASE,
+)
+HUNGARIAN_BARE_COMPARISON_RE = re.compile(
+    r"(?P<article>\b(?:a|az)\s+)(?P<side>bal|jobb)\b(?=\s+"
+    r"(?:nyert|jobb|gyengébb|erősebb|szakmaibb|természetesebb|hatásosabb|"
+    r"tetszik|működik|vitt|visz)\b)",
+    re.IGNORECASE,
+)
+ENGLISH_POSITION_RE = re.compile(
+    r"(?P<article>\bthe\s+)?(?P<side>left|right)(?:[- ]hand)?\s+"
+    r"(?:candidate|one|version|option|answer|text|draft)\b",
+    re.IGNORECASE,
+)
+ENGLISH_BARE_COMPARISON_RE = re.compile(
+    r"(?P<article>\bthe\s+)(?P<side>left|right)\b(?=\s+"
+    r"(?:wins?|won|is|was|reads?|feels?|works?|sounds?)\b)",
+    re.IGNORECASE,
+)
+HUNGARIAN_EXPLICIT_ORDINAL_RE = re.compile(
+    r"(?P<article>\b(?:a|az)\s+)(?P<ordinal>első|második)\s+"
+    r"(?:változat|jelölt|szöveg|verzió|opció|válasz)\b",
+    re.IGNORECASE,
+)
+HUNGARIAN_IMPLICIT_ORDINAL_RE = re.compile(
+    r"(?P<article>\b(?:a|az)\s+)(?P<ordinal>első|második)"
+    r"(?P<suffix>ban|ben|nál|nél|ból|ből|hoz|hez|höz|nak|nek|ra|re|ról|ről|ként|tól|től)\b",
+    re.IGNORECASE,
+)
 SYSTEM_LABELS = {"engine_v3": "Engine v3-változat", "legacy": "legacy-változat"}
+ENGLISH_SYSTEM_LABELS = {"engine_v3": "Engine v3 candidate", "legacy": "legacy candidate"}
 HUNGARIAN_SIDE_KEYS = {"bal": "left", "jobb": "right"}
+ENGLISH_SIDE_KEYS = {"left": "left", "right": "right"}
+HUNGARIAN_ORDINAL_KEYS = {"első": "left", "második": "right"}
 FORM_SUFFIXES = {
     "i": "",
     "iban": "ban",
@@ -59,6 +93,26 @@ FORM_SUFFIXES = {
     "it": "ot",
     "in": "on",
     "o": "",
+}
+ORDINAL_SUFFIXES = {
+    "ban": "ban",
+    "ben": "ban",
+    "nál": "nál",
+    "nél": "nál",
+    "ból": "ból",
+    "ből": "ból",
+    "hoz": "hoz",
+    "hez": "hoz",
+    "höz": "hoz",
+    "nak": "nak",
+    "nek": "nak",
+    "ra": "ra",
+    "re": "ra",
+    "ról": "ról",
+    "ről": "ról",
+    "ként": "ként",
+    "tól": "tól",
+    "től": "tól",
 }
 
 
@@ -190,8 +244,14 @@ def _system_reference(system: str, form: str, *, capitalized: bool) -> str:
     return label
 
 
-def _sanitize_feedback_text(value: str, side_map: dict) -> str:
+def _sanitize_feedback_text(value: str, side_map: dict, *, implicit_ordinals: bool = False) -> str:
     """Replace blind-test candidate positions while preserving ordinary spatial wording."""
+    def hungarian_phrase(system: str, article_text: str, suffix: str = "") -> str:
+        article = "az" if system == "engine_v3" else "a"
+        if article_text[0].isupper():
+            article = article[:1].upper() + article[1:]
+        return f"{article} {SYSTEM_LABELS[system]}{suffix}"
+
     def replace_adjective(match: re.Match) -> str:
         system = side_map[HUNGARIAN_SIDE_KEYS[match.group("side").casefold()]]
         article = match.group("article")
@@ -205,12 +265,40 @@ def _sanitize_feedback_text(value: str, side_map: dict) -> str:
 
     def replace_standalone(match: re.Match) -> str:
         system = side_map[HUNGARIAN_SIDE_KEYS[match.group("side").casefold()]]
-        article = "az" if system == "engine_v3" else "a"
-        if match.group("article")[0].isupper():
-            article = article[:1].upper() + article[1:]
-        return f"{article} {SYSTEM_LABELS[system]}"
+        return hungarian_phrase(system, match.group("article"))
 
-    return STANDALONE_SIDE_RE.sub(replace_standalone, SIDE_ADJECTIVE_RE.sub(replace_adjective, value))
+    def replace_hungarian_position(match: re.Match) -> str:
+        system = side_map[HUNGARIAN_SIDE_KEYS[match.group("side").casefold()]]
+        return hungarian_phrase(system, match.group("article"))
+
+    def replace_english_position(match: re.Match) -> str:
+        system = side_map[ENGLISH_SIDE_KEYS[match.group("side").casefold()]]
+        label = ENGLISH_SYSTEM_LABELS[system]
+        article = match.group("article")
+        if article is None:
+            return label[:1].upper() + label[1:] if match.group(0)[0].isupper() else label
+        replacement_article = "The" if article[0].isupper() else "the"
+        return f"{replacement_article} {label}"
+
+    def replace_explicit_ordinal(match: re.Match) -> str:
+        side = HUNGARIAN_ORDINAL_KEYS[match.group("ordinal").casefold()]
+        return hungarian_phrase(side_map[side], match.group("article"))
+
+    def replace_implicit_ordinal(match: re.Match) -> str:
+        side = HUNGARIAN_ORDINAL_KEYS[match.group("ordinal").casefold()]
+        suffix = ORDINAL_SUFFIXES[match.group("suffix").casefold()]
+        return hungarian_phrase(side_map[side], match.group("article"), suffix)
+
+    sanitized = SIDE_ADJECTIVE_RE.sub(replace_adjective, value)
+    sanitized = HUNGARIAN_POSITION_NOUN_RE.sub(replace_hungarian_position, sanitized)
+    sanitized = HUNGARIAN_BARE_COMPARISON_RE.sub(replace_hungarian_position, sanitized)
+    sanitized = STANDALONE_SIDE_RE.sub(replace_standalone, sanitized)
+    sanitized = ENGLISH_POSITION_RE.sub(replace_english_position, sanitized)
+    sanitized = ENGLISH_BARE_COMPARISON_RE.sub(replace_english_position, sanitized)
+    sanitized = HUNGARIAN_EXPLICIT_ORDINAL_RE.sub(replace_explicit_ordinal, sanitized)
+    if implicit_ordinals:
+        sanitized = HUNGARIAN_IMPLICIT_ORDINAL_RE.sub(replace_implicit_ordinal, sanitized)
+    return sanitized
 
 
 def _make_observation(identity: dict, content: dict, item: dict, result_sha: str, created_at: str) -> dict:
@@ -264,9 +352,11 @@ def build_observation_records(result: dict, private_key: dict) -> list[dict]:
         }
         content = {
             "chosen_system": item["chosen_system"],
-            "reason": _sanitize_feedback_text(item["reason"], side_map),
+            "reason": _sanitize_feedback_text(item["reason"], side_map, implicit_ordinals=True),
             "flags": list(item.get("flags") or []),
-            "general_note": _sanitize_feedback_text(item.get("general_note", ""), side_map),
+            "general_note": _sanitize_feedback_text(
+                item.get("general_note", ""), side_map, implicit_ordinals=True
+            ),
             "candidate_feedback": candidate_feedback,
             "draft_sha256_by_system": draft_hashes,
         }

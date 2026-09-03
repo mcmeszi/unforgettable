@@ -1281,6 +1281,47 @@ class HumanBlindImportTests(unittest.TestCase):
         self.assertIn("legacy-változat", rendered)
         self.assertIn("jobb oldalán egy kutyás matrica", rendered)
 
+    def test_import_sanitizes_english_and_common_hungarian_candidate_references(self):
+        result = make_human_result(item_count=1)
+        result["items"][0]["reason"] = (
+            "The left candidate wins; the right one is weaker. "
+            "A bal nyert, a jobb gyengébb. "
+            "A bal oldalon lévő változat szakmaibb."
+        )
+
+        record = importer.build_observation_records(result, make_private_key(item_count=1))[0]
+        rendered = record["content"]["reason"].casefold()
+
+        self.assertNotRegex(rendered, r"\b(?:left|right)\s+(?:candidate|one|version)")
+        self.assertNotRegex(rendered, r"\ba (?:bal|jobb)\b")
+        self.assertNotRegex(rendered, r"\b(?:bal|jobb) oldalon lévő")
+        self.assertIn("engine v3", rendered)
+        self.assertIn("legacy", rendered)
+
+    def test_import_sanitizes_candidate_ordinals_but_preserves_quoted_source_words(self):
+        result = make_human_result(item_count=1)
+        result["items"][0]["reason"] = (
+            "Az első változat lendületesebb, de a másodikban klisés a felállás. "
+            "Az első ötletet viszont általában érdemes elvetni."
+        )
+        quoted_source = "Az „első” még kicsi szám."
+        result["items"][0]["candidate_feedback"]["engine_v3"]["highlight"] = quoted_source
+
+        record = importer.build_observation_records(result, make_private_key(item_count=1))[0]
+
+        self.assertNotRegex(
+            record["content"]["reason"].casefold(),
+            r"\b(?:első|második)(?:ban|ben|nál|nél)|"
+            r"\b(?:első|második) (?:változat|jelölt|szöveg|verzió|opció|válasz)\b",
+        )
+        self.assertIn("Engine v3-változat", record["content"]["reason"])
+        self.assertIn("legacy-változatban", record["content"]["reason"])
+        self.assertIn("Az első ötletet", record["content"]["reason"])
+        self.assertEqual(
+            quoted_source,
+            record["content"]["candidate_feedback"]["engine_v3"]["highlight"],
+        )
+
     def test_import_uses_reversed_private_mapping_when_naming_candidate_references(self):
         private_key = make_private_key(item_count=1)
         mapping = private_key["items"]["item-01"]
