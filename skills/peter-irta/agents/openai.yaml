@@ -1,0 +1,4 @@
+interface:
+  display_name: "Péter írta"
+  short_description: "Vault-alapú saját hang minden műfajhoz"
+  default_prompt: "Use $peter-irta to write this from my full-text Mind Vault in my genre-appropriate voice."
